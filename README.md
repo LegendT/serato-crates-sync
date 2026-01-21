@@ -203,6 +203,16 @@ pytest
 pytest --cov=serato_crates_sync
 ```
 
+## Track Metadata (BPM, Key, etc.)
+
+This tool creates crate structures only. To get BPM, key, and other analysis data:
+
+1. Open Serato DJ Pro
+2. Select tracks or folders in the Files panel
+3. Right-click → "Analyze Files"
+
+Or simply load tracks to a deck - Serato analyzes them automatically.
+
 ## Troubleshooting
 
 ### Old crates still showing in Serato
