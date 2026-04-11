@@ -92,6 +92,23 @@ serato-crates sync \
   --verbose                          # Show track names in output
 ```
 
+### Paths with Spaces
+
+If your music folder path contains spaces, wrap it in quotes:
+
+```bash
+# Double quotes
+serato-crates sync --music-root "/Users/anthonygeorge/Music/_DJ MUSIC/DJ - C"
+
+# Single quotes also work
+serato-crates sync --music-root '/Volumes/My Drive/DJ Music'
+
+# Or escape each space with a backslash
+serato-crates sync --music-root /Users/anthonygeorge/Music/_DJ\ MUSIC/DJ\ -\ C
+```
+
+This applies to `--serato-root` as well.
+
 ### Examples
 
 ```bash
