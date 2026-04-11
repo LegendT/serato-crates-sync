@@ -21,11 +21,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Audio file extensions supported by Serato
 DEFAULT_AUDIO_EXTENSIONS = frozenset({".mp3", ".m4a", ".aiff", ".aif", ".wav", ".flac"})
 
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(levelname)s: %(message)s"
@@ -113,25 +111,31 @@ def build_crate_tree(
         return None
 
     crate_name = folder.name
-    tracks = scan_folder_for_tracks(folder, extensions)
-    children = []
+    tracks = []
+    subdirs = []
 
-    # Recursively process subfolders (sorted for determinism)
     try:
-        for subfolder in sorted(folder.iterdir()):
-            if subfolder.is_dir() and not subfolder.name.startswith("."):
-                child_crate = build_crate_tree(
-                    subfolder,
-                    extensions,
-                    parent_name=crate_name if parent_name is None else f"{parent_name}%%{crate_name}",
-                    include_empty=include_empty
-                )
-                if child_crate:
-                    children.append(child_crate)
+        for item in sorted(folder.iterdir()):
+            if item.name.startswith("."):
+                continue
+            if item.is_dir():
+                subdirs.append(item)
+            elif item.is_file() and item.suffix.lower() in extensions:
+                tracks.append(item)
     except PermissionError:
         logger.warning(f"Permission denied: {folder}")
 
-    # Only create crate if it has tracks or children (or include_empty)
+    children = []
+    for subfolder in subdirs:
+        child_crate = build_crate_tree(
+            subfolder,
+            extensions,
+            parent_name=crate_name if parent_name is None else f"{parent_name}%%{crate_name}",
+            include_empty=include_empty
+        )
+        if child_crate:
+            children.append(child_crate)
+
     if tracks or children or include_empty:
         return CratePlan(
             name=crate_name,
@@ -194,7 +198,6 @@ def create_sync_plan(
     """
     crates = []
 
-    # Build the root folder as the main crate with all subfolders as subcrates
     root_crate = build_crate_tree(music_root, extensions, include_empty=include_empty)
     if root_crate:
         crates.append(root_crate)
@@ -493,10 +496,7 @@ def sanitize_crate_filename(filename: str, max_bytes: int = 240) -> str:
     # Truncate if too long (encode to check byte length)
     encoded = filename.encode('utf-8')
     if len(encoded) > max_bytes:
-        # Truncate by bytes, being careful not to split multi-byte chars
-        while len(filename.encode('utf-8')) > max_bytes:
-            filename = filename[:-1]
-        # Add indicator that it was truncated
+        filename = encoded[:max_bytes].decode('utf-8', errors='ignore')
         filename = filename.rstrip() + '…'
 
     return filename.strip()
@@ -672,8 +672,6 @@ def clear_crates_from_sqlite() -> int:
     Returns:
         Number of crates deleted
     """
-    import sqlite3
-
     cache_folder = get_serato_cache_folder()
     db_path = cache_folder / "Library" / "root.sqlite"
 
@@ -723,7 +721,6 @@ def write_crates_to_sqlite(
     Returns:
         Tuple of (crates_created, crates_skipped)
     """
-    import sqlite3
     import time
 
     # Find the SQLite database
@@ -877,6 +874,18 @@ def execute_sync(
     return True
 
 
+def validate_music_root(raw_path: Path) -> Optional[Path]:
+    """Resolve and validate a music root path. Returns resolved Path or None."""
+    resolved = raw_path.expanduser().resolve()
+    if not resolved.exists():
+        logger.error(f"Music root does not exist: {resolved}")
+        return None
+    if not resolved.is_dir():
+        logger.error(f"Music root is not a directory: {resolved}")
+        return None
+    return resolved
+
+
 def parse_extensions(ext_str: str) -> frozenset[str]:
     """Parse comma-separated extensions into a frozenset."""
     extensions = set()
@@ -1010,13 +1019,8 @@ Safety:
         return 1
 
     if args.command == "sync":
-        # Validate music root
-        music_root = args.music_root.expanduser().resolve()
-        if not music_root.exists():
-            logger.error(f"Music root does not exist: {music_root}")
-            return 1
-        if not music_root.is_dir():
-            logger.error(f"Music root is not a directory: {music_root}")
+        music_root = validate_music_root(args.music_root)
+        if music_root is None:
             return 1
 
         # Set Serato root
@@ -1064,13 +1068,8 @@ Safety:
         return 0 if success else 1
 
     elif args.command == "guide":
-        # Validate music root
-        music_root = args.music_root.expanduser().resolve()
-        if not music_root.exists():
-            logger.error(f"Music root does not exist: {music_root}")
-            return 1
-        if not music_root.is_dir():
-            logger.error(f"Music root is not a directory: {music_root}")
+        music_root = validate_music_root(args.music_root)
+        if music_root is None:
             return 1
 
         # Parse extensions
@@ -1109,62 +1108,48 @@ def print_serato_guide(music_root: Path, extensions: frozenset[str], max_depth: 
     print("-" * 70)
     print()
 
-    def count_tracks(folder: Path) -> int:
-        """Count audio files in a folder (non-recursive)."""
-        count = 0
+    def scan_folder_summary(folder: Path) -> tuple[int, list[Path]]:
+        """Single-pass scan: returns (track_count, subdirectories)."""
+        track_count = 0
+        subdirs = []
         try:
-            for item in folder.iterdir():
-                if item.is_file() and item.suffix.lower() in extensions:
-                    count += 1
+            for item in sorted(folder.iterdir()):
+                if item.name.startswith("."):
+                    continue
+                if item.is_dir():
+                    subdirs.append(item)
+                elif item.is_file() and item.suffix.lower() in extensions:
+                    track_count += 1
         except PermissionError:
             pass
-        return count
+        return track_count, subdirs
 
     def print_folder_tree(folder: Path, prefix: str = "", depth: int = 0) -> int:
         """Print folder tree with track counts."""
         if depth > max_depth:
             return 0
 
+        _, subdirs = scan_folder_summary(folder)
         total_folders = 0
 
-        try:
-            items = sorted([
-                item for item in folder.iterdir()
-                if item.is_dir() and not item.name.startswith(".")
-            ])
-        except PermissionError:
-            return 0
+        for i, item in enumerate(subdirs):
+            is_last = (i == len(subdirs) - 1)
+            track_count, child_subdirs = scan_folder_summary(item)
 
-        for i, item in enumerate(items):
-            is_last = (i == len(items) - 1)
-            track_count = count_tracks(item)
-
-            # Count subfolders
-            try:
-                subfolder_count = len([
-                    x for x in item.iterdir()
-                    if x.is_dir() and not x.name.startswith(".")
-                ])
-            except PermissionError:
-                subfolder_count = 0
-
-            # Print this folder
-            connector = "└── " if is_last else "├── "
+            connector = "\u2514\u2500\u2500 " if is_last else "\u251c\u2500\u2500 "
             track_info = f"({track_count} tracks)" if track_count > 0 else "(empty)"
-            subfolder_info = f" [{subfolder_count} subfolders]" if subfolder_count > 0 else ""
+            subfolder_info = f" [{len(child_subdirs)} subfolders]" if child_subdirs else ""
 
             print(f"{prefix}{connector}{item.name} {track_info}{subfolder_info}")
             total_folders += 1
 
-            # Recurse into subfolders
             if depth < max_depth:
-                new_prefix = prefix + ("    " if is_last else "│   ")
+                new_prefix = prefix + ("    " if is_last else "\u2502   ")
                 total_folders += print_folder_tree(item, new_prefix, depth + 1)
 
         return total_folders
 
-    # Print root folder
-    root_tracks = count_tracks(music_root)
+    root_tracks, _ = scan_folder_summary(music_root)
     print(f"{music_root.name}/ ({root_tracks} tracks)")
 
     total = print_folder_tree(music_root)
