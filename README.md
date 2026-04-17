@@ -54,6 +54,19 @@ pip install -e ".[dev]"
 
 ## Usage
 
+### Quick Start (Wrapper Script)
+
+A `sync.sh` wrapper is included for the common case. It activates the venv and passes through any flags:
+
+```bash
+./sync.sh                  # Dry-run preview (safe, no writes)
+./sync.sh --apply          # Write crates
+./sync.sh --apply --clean  # Wipe existing crates (with backup) and write fresh
+./sync.sh --apply --verbose
+```
+
+The script hard-codes the music root to `$HOME/Music/_DJ MUSIC/DJ - C`. Edit `sync.sh` to change it for your setup.
+
 ### Dry Run (Preview Changes)
 
 ```bash
