@@ -65,7 +65,13 @@ A `sync.sh` wrapper is included for the common case. It activates the venv and p
 ./sync.sh --apply --verbose
 ```
 
-The script hard-codes the music root to `$HOME/Music/_DJ MUSIC/DJ - C`. Edit `sync.sh` to change it for your setup.
+The script defaults to `$HOME/Music/_DJ MUSIC/DJ - C`. Override per-run with `MUSIC_ROOT`:
+
+```bash
+MUSIC_ROOT="/Users/anthonygeorge/Music/_In Progress/Friday Freestyle" ./sync.sh --apply
+```
+
+Or edit `sync.sh` to change the default permanently.
 
 ### Dry Run (Preview Changes)
 
