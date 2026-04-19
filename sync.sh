@@ -8,5 +8,5 @@
 set -e
 cd "$(dirname "$0")"
 exec .venv/bin/serato-crates sync \
-    --music-root "${MUSIC_ROOT:-$HOME/Music/_DJ MUSIC/DJ - C}" \
+    --music-root "${MUSIC_ROOT:-$HOME/Music/DJ}" \
     "$@"

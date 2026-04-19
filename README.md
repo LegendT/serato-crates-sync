@@ -65,10 +65,10 @@ A `sync.sh` wrapper is included for the common case. It activates the venv and p
 ./sync.sh --apply --verbose
 ```
 
-The script defaults to `$HOME/Music/_DJ MUSIC/DJ - C`. Override per-run with `MUSIC_ROOT`:
+The script defaults to `$HOME/Music/DJ`. Override per-run with `MUSIC_ROOT`:
 
 ```bash
-MUSIC_ROOT="/Users/anthonygeorge/Music/_In Progress/Friday Freestyle" ./sync.sh --apply
+MUSIC_ROOT="$HOME/Music/Other Folder" ./sync.sh --apply
 ```
 
 Or edit `sync.sh` to change the default permanently.
@@ -117,13 +117,13 @@ If your music folder path contains spaces, wrap it in quotes:
 
 ```bash
 # Double quotes
-serato-crates sync --music-root "/Users/anthonygeorge/Music/_DJ MUSIC/DJ - C"
+serato-crates sync --music-root "$HOME/Music/My DJ Folder"
 
 # Single quotes also work
 serato-crates sync --music-root '/Volumes/My Drive/DJ Music'
 
 # Or escape each space with a backslash
-serato-crates sync --music-root /Users/anthonygeorge/Music/_DJ\ MUSIC/DJ\ -\ C
+serato-crates sync --music-root ~/Music/My\ DJ\ Folder
 ```
 
 This applies to `--serato-root` as well.
