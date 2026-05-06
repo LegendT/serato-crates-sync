@@ -28,8 +28,10 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e .
 ```
 
-Requires Python 3.10+. Tested on macOS (primary), should work on
-Windows / Linux.
+Requires Python 3.10+. Developed and tested on macOS; Windows and
+Linux are untested. The Serato-running guard relies on `pgrep`, so
+on platforms without it `fix-paths --apply` falls back to the SQLite
+write-lock check alone.
 
 ## Quickstart
 
@@ -42,6 +44,10 @@ serato-crates sync --music-root ~/Music/DJ --apply   # write
 
 Folders become crates, subfolders become subcrates with a `%%`
 delimiter (`House%%Deep.crate`).
+
+A `./sync.sh` wrapper is also included for the common case (defaults
+to `~/Music/DJ`, activates the venv, passes flags through). See
+[docs/usage.md](docs/usage.md#sync) for details.
 
 ### Audit library health (read-only)
 
@@ -70,8 +76,9 @@ runs the entire repair in a single SQLite transaction.
 - **Automatic backup.** `sync` copies `Subcrates/` to a timestamped
   sibling; `fix-paths` snapshots `master.sqlite` via SQLite's Backup
   API and runs `PRAGMA integrity_check` on the snapshot.
-- **`fix-paths --apply` refuses to run while Serato is open.** Detected
-  via `pgrep` plus `BEGIN IMMEDIATE` lock contention.
+- **`fix-paths --apply` refuses to run while Serato is open** on
+  macOS, detected via `pgrep`. On other platforms the `BEGIN
+  IMMEDIATE` lock contention check is the sole guard.
 - **Single-transaction atomicity.** Any error during `fix-paths` rolls
   back fully; the audit log is only finalised on commit.
 - **`diagnose` and `verify-paths` are read-only** and safe to run while

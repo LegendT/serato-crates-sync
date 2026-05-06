@@ -49,8 +49,10 @@ serato-crates sync --music-root ~/Music/DJ --apply
 
 ### Clean start (recommended for first run)
 
-Deletes all existing crates and creates fresh ones; clears Serato's
-caches to ensure a clean state:
+Backs up the existing `Subcrates/` folder, deletes every `.crate`
+file, then writes a fresh set from the current folder hierarchy.
+Useful when prior crates are stale or you've reorganised your folder
+tree and want crates to mirror it without leftovers:
 
 ```bash
 serato-crates sync --music-root ~/Music/DJ --apply --clean
@@ -78,7 +80,7 @@ serato-crates sync \
 # Basic scan of your DJ folder
 serato-crates sync --music-root "/Volumes/DJ Drive/Music"
 
-# Clean start - removes old crates and all Serato caches
+# Clean start - backs up Subcrates, deletes all .crate files, writes fresh ones
 serato-crates sync --music-root ~/Music/DJ --apply --clean
 
 # Apply with verbose output

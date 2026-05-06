@@ -40,13 +40,17 @@ Crates live under `_Serato_/Subcrates/`.
 
 ## What `--clean` does
 
-When you use `sync --apply --clean`, the tool:
+`sync --apply --clean` backs up the existing `Subcrates/` folder,
+deletes every `.crate` file inside it, and then writes the fresh set
+from your folder hierarchy.
 
-1. **Backs up** the existing `Subcrates` folder.
-2. **Deletes** all `.crate` files.
-3. **Creates** fresh crate files from your folder structure.
-
-This ensures you start with a clean slate.
+It does **not** touch `master.sqlite` or any of Serato's other
+caches — `.crate` files are the only thing affected. The reason this
+fixes "old crates still showing" is that quitting Serato lets it
+re-read `Subcrates/` on next launch; with stale `.crate` files
+removed, the panel reflects the new layout. If you suspect
+`master.sqlite` is the problem (missing tracks, stale asset paths),
+use `diagnose` and `fix-paths` instead.
 
 ## Design decisions
 
@@ -123,21 +127,6 @@ Or simply load tracks to a deck — Serato analyses them automatically.
 
 ## Running tests
 
-```bash
-# Install dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Run with coverage
-pytest --cov=serato_crates_sync --cov-report=term-missing
-
-# Lint
-ruff check src/ tests/
-```
-
-CI runs the same suite on Ubuntu and macOS across Python 3.10–3.13,
-plus a separate `ruff` lint job. See [CONTRIBUTING.md](../CONTRIBUTING.md)
-for test conventions and the safety invariants `fix-paths` must
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the dev-environment
+setup, the test commands, and the safety invariants `fix-paths` must
 preserve.

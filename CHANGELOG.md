@@ -7,8 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
+### Added
 
+- `SECURITY.md` with vulnerability disclosure path and the safety
+  invariants `fix-paths --apply` is committed to upholding.
 - README restructured for first-time visitors: the landing page is
   now ~100 lines (down from ~500), with detail relocated into a
   `docs/` folder. Nothing removed.
@@ -18,11 +20,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     procedures for both `sync` and `fix-paths`.
   - `docs/internals.md` — concepts, design decisions, the Serato
     crate format, and the `master.sqlite` vs `Subcrates/` layout.
-
-### Added
-
-- `SECURITY.md` with vulnerability disclosure path and the safety
-  invariants `fix-paths --apply` is committed to upholding.
 - Audit log now includes an `applied_at` UTC timestamp column. Existing
   audit logs from v0.2.0 are still readable; the new column is appended.
 - `fix-paths --apply` prints a "Preflight" summary line per safety
