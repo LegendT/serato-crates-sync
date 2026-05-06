@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from serato_crates_sync.cli import (
+from serato_crates_sync.diagnose import (
     DiagnosticReport,
     export_duplicate_tracks_csv,
     export_missing_assets_csv,
