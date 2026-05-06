@@ -277,6 +277,20 @@ Flags:
 - `--repair-only` — skip merges; only handle pure path UPDATEs (rare)
 - `--audit-log PATH` — override the default audit CSV location
 
+#### Audit log columns
+
+`fix-paths-applied.csv` is written after a successful commit (an
+in-progress copy is dropped on rollback / kill). Columns:
+
+| Column | Meaning |
+|---|---|
+| `applied_at` | UTC ISO-8601 timestamp of when the row was processed |
+| `asset_id` | The `asset.id` the CSV row refers to |
+| `old_portable_id` | Path the row had before fix-paths touched it |
+| `proposed_new_portable_id` | Path verify-paths suggested (blank for orphans) |
+| `action` | One of `updated`, `merged`, `orphan_deleted`, or a `skipped_*` reason |
+| `merged_into_id` | For `merged` rows: the surviving healthy asset's id |
+
 ## Verification Checklist
 
 After running with `--apply`, verify in Serato DJ Pro 4.0.2:
@@ -450,10 +464,12 @@ Either:
 
 ### Serato shows "Operation failed. Crates and files may not appear correctly"
 
-Most often after running `fix-paths --apply` if the database has been
-left with dangling references (e.g. asset deletions that didn't sweep
-up rows in tables without a foreign key on `asset_id`). Recent versions
-of `fix-paths` clean these up automatically, but if you hit this:
+This was caused on `fix-paths` v0.1.x by dangling rows left behind in
+tables with informal `asset_id` columns (no foreign key) —
+`container_asset` and the `anonymous_table_*` sort caches. **v0.2.0+
+cleans these up automatically**, so you should not hit this on the
+current code. If you encounter it on an older version, or if Serato
+reports it for unrelated reasons:
 
 1. Quit Serato (Cmd+Q).
 2. Check `~/Music/_Serato_/Logs/` — the most recent log usually pinpoints
@@ -462,9 +478,9 @@ of `fix-paths` clean these up automatically, but if you hit this:
    - **Roll back** to the `master.sqlite.BACKUP.<timestamp>` taken before
      the run (see "How to Roll Back" above), or
    - **Forward-fix** by deleting any rows whose `asset_id` no longer
-     exists. The dangling tables in past incidents have been
-     `container_asset` and `anonymous_table_0` / `anonymous_table_1` /
-     `anonymous_table_2`.
+     exists in the asset table. The dangling tables in past incidents
+     were `container_asset` and `anonymous_table_0` /
+     `anonymous_table_1` / `anonymous_table_2`.
 
 ### Tool can't find serato-crate
 

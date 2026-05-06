@@ -12,8 +12,6 @@ import sqlite3
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
-
 
 __all__ = [
     "DEFAULT_AUDIO_EXTENSIONS",
@@ -94,8 +92,11 @@ def is_serato_running() -> bool:
     Used as a guard before opening master.sqlite for writing.
     """
     try:
+        # Match any of: "Serato DJ Pro.app", "Serato DJ Lite.app",
+        # "Serato Studio.app", "Serato DJ.app". Earlier versions only
+        # matched DJ Pro; users on Studio / Lite would slip past the guard.
         result = subprocess.run(
-            ["pgrep", "-f", "Serato DJ Pro.app"],
+            ["pgrep", "-f", r"Serato( DJ( Pro| Lite)?| Studio)?\.app"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -108,7 +109,7 @@ def is_serato_running() -> bool:
     return result.returncode == 0
 
 
-def validate_music_root(raw_path: Path) -> Optional[Path]:
+def validate_music_root(raw_path: Path) -> Path | None:
     """Resolve and validate a music root path. Returns resolved Path or None."""
     resolved = raw_path.expanduser().resolve()
     if not resolved.exists():

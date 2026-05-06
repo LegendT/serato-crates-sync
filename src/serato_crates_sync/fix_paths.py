@@ -13,9 +13,8 @@ import csv
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from .library import (
     SAFE_IDENT,
@@ -23,7 +22,6 @@ from .library import (
     is_serato_running,
     logger,
 )
-
 
 __all__ = [
     "FixStats",
@@ -62,9 +60,11 @@ def backup_serato_library(library_path: Path) -> Path:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
 
-    src = sqlite3.connect(str(library_path))
+    # timeout so we don't hang forever if Serato slipped past pgrep and
+    # has the database locked.
+    src = sqlite3.connect(str(library_path), timeout=10.0)
     try:
-        dst = sqlite3.connect(str(backup_path))
+        dst = sqlite3.connect(str(backup_path), timeout=10.0)
         try:
             src.backup(dst)
         finally:
@@ -183,6 +183,7 @@ def _process_fix_row(
     def log(action: str, merged_into: str = "") -> None:
         if audit_writer is not None:
             audit_writer.writerow([
+                datetime.now(timezone.utc).isoformat(timespec="seconds"),
                 asset_id, old_path, proposed, action, merged_into,
             ])
 
@@ -292,7 +293,7 @@ def apply_fixes(
     keep_orphans: bool,
     ambiguous_too: bool,
     repair_only: bool,
-    audit_log_path: Optional[Path],
+    audit_log_path: Path | None,
     progress_every: int = 50000,
 ) -> FixStats:
     """Stream the path-fixes CSV and apply each row's repair (or dry-run)."""
@@ -309,8 +310,8 @@ def apply_fixes(
         audit_file = audit_log_path.open("w", newline="", encoding="utf-8")
         audit_writer = csv.writer(audit_file)
         audit_writer.writerow([
-            "asset_id", "old_portable_id", "proposed_new_portable_id",
-            "action", "merged_into_id",
+            "applied_at", "asset_id", "old_portable_id",
+            "proposed_new_portable_id", "action", "merged_into_id",
         ])
 
     # Pre-count the CSV so we can show an ETA. Cheap compared to the work
@@ -384,7 +385,7 @@ def run_fix_paths(
     keep_orphans: bool,
     ambiguous_too: bool,
     repair_only: bool,
-    audit_log_path: Optional[Path],
+    audit_log_path: Path | None,
 ) -> int:
     """Apply (or dry-run) repairs from a path-fixes.csv against master.sqlite."""
     if not library_path.exists():
@@ -404,7 +405,7 @@ def run_fix_paths(
     # we'll atomic-rename onto it after a successful commit so a kill or
     # rollback never leaves a stale audit log claiming work that didn't
     # actually persist.
-    audit_tmp_path: Optional[Path] = None
+    audit_tmp_path: Path | None = None
     if audit_log_path is not None:
         if apply:
             audit_tmp_path = audit_log_path.with_name(
@@ -415,8 +416,9 @@ def run_fix_paths(
             audit_tmp_path = audit_log_path
 
     if apply:
+        print("Preflight:")
         backup = backup_serato_library(library_path)
-        print(f"Backup: {backup}")
+        print(f"  [ok] backup created  {backup}")
         # isolation_level=None lets us drive transactions explicitly so a single
         # BEGIN IMMEDIATE ... COMMIT spans the whole run and rolls back
         # atomically on error.
@@ -437,6 +439,7 @@ def run_fix_paths(
                 fk_state,
             )
             return 1
+        print("  [ok] foreign-key enforcement engaged")
         # BEGIN IMMEDIATE acquires the write lock right away. If another
         # process (Serato that pgrep missed, a stray shell, etc.) holds
         # it, we get SQLITE_BUSY here rather than corrupting later.
@@ -451,6 +454,7 @@ def run_fix_paths(
                 e,
             )
             return 1
+        print("  [ok] write lock acquired\n")
     else:
         conn = connect_serato_library_readonly(library_path)
 
@@ -489,5 +493,15 @@ def run_fix_paths(
 
     print_fix_stats(stats, dry_run=not apply)
     if audit_log_path is not None:
-        print(f"Audit log: {audit_log_path}\n")
+        print(f"Audit log: {audit_log_path}")
+    if apply:
+        # Reminder for the rollback case: SQLite leaves -wal/-shm sibling
+        # files alongside the main DB. Restoring just master.sqlite from
+        # the BACKUP file without removing those leaves the live WAL in
+        # control, hiding the restore.
+        print(
+            "\nRollback note: if you need to revert, also delete "
+            f"{library_path.name}-wal and {library_path.name}-shm "
+            "before restoring the backup over master.sqlite.\n"
+        )
     return 0

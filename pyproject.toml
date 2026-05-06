@@ -29,8 +29,8 @@ classifiers = [
     "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = [
-    "serato-crate>=0.0.1",
-    "typing_extensions>=4.0.0",
+    "serato-crate>=0.0.1,<1.0",
+    "typing_extensions>=4.0.0,<5",
 ]
 
 [project.optional-dependencies]
@@ -49,3 +49,20 @@ where = ["src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# Pragmatic baseline. E (pycodestyle) catches obvious issues, F (pyflakes)
+# unused imports / undefined names, B (bugbear) common bug patterns,
+# UP (pyupgrade) modernisation hints, I (isort) import ordering.
+select = ["E", "F", "B", "UP", "I"]
+# E501 line-too-long: handled loosely; we have a few long error strings.
+# B008 function-call-in-default: argparse uses Path() in defaults.
+ignore = ["E501", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]  # module-level imports not at top of file (test fixtures)
+

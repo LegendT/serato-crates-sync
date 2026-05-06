@@ -10,10 +10,8 @@ import csv
 import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .library import connect_serato_library_readonly, logger
-
 
 __all__ = [
     "DiagnosticReport",
@@ -34,7 +32,7 @@ class DiagnosticReport:
     corrupt_assets: int
     distinct_file_names: int
     distinct_paths: int
-    by_location: list[tuple[int, int, int, int]]  # (location_id, total, missing, corrupt)
+    by_location: list[tuple[int, int, int, int, str]]  # (location_id, total, missing, corrupt, path)
     duplicate_metadata_groups: int
     duplicate_metadata_excess_rows: int
 
@@ -61,12 +59,26 @@ def gather_diagnostics(conn: sqlite3.Connection) -> DiagnosticReport:
     cur.execute("SELECT COUNT(DISTINCT portable_id) FROM asset")
     distinct_paths = cur.fetchone()[0]
 
+    # LEFT JOIN against location so we can show the path (if set) alongside
+    # the bare location_id, which is meaningless to a human reader.
+    # Falls back gracefully for synthetic test schemas that don't have a
+    # `location` table at all.
+    location_paths: dict[int, str] = {}
+    try:
+        for loc_id, path in cur.execute("SELECT id, path FROM location"):
+            location_paths[loc_id] = path or ""
+    except sqlite3.OperationalError:
+        location_paths = {}
+
     cur.execute(
         "SELECT location_id, COUNT(*), COALESCE(SUM(is_missing), 0), "
         "       COALESCE(SUM(is_corrupt), 0) "
         "FROM asset GROUP BY location_id ORDER BY location_id"
     )
-    by_location = [tuple(row) for row in cur.fetchall()]
+    by_location = [
+        (loc_id, total_n, missing_n, corrupt_n, location_paths.get(loc_id, ""))
+        for (loc_id, total_n, missing_n, corrupt_n) in cur.fetchall()
+    ]
 
     # Strong duplicate key: same artist + name + length within a location.
     # Filename-only would lump every "Track01.mp3" together — useless noise.
@@ -165,9 +177,10 @@ def print_diagnostic_report(report: DiagnosticReport) -> None:
     print(f"Corrupt:           {report.corrupt_assets:>10,}")
     print(f"{'-'*60}")
     print("By location:")
-    print(f"  {'location_id':>11}  {'total':>10}  {'missing':>10}  {'corrupt':>10}")
-    for loc_id, total, n_missing, n_corrupt in report.by_location:
-        print(f"  {loc_id:>11}  {total:>10,}  {n_missing:>10,}  {n_corrupt:>10,}")
+    print(f"  {'id':>3}  {'total':>10}  {'missing':>10}  {'corrupt':>10}  path")
+    for loc_id, total, n_missing, n_corrupt, path in report.by_location:
+        path_label = path if path else "(no path recorded)"
+        print(f"  {loc_id:>3}  {total:>10,}  {n_missing:>10,}  {n_corrupt:>10,}  {path_label}")
     print(f"{'-'*60}")
     print("Duplicate tracks (same artist + name + length):")
     print(f"  Duplicate groups:        {report.duplicate_metadata_groups:>10,}")
@@ -175,7 +188,7 @@ def print_diagnostic_report(report: DiagnosticReport) -> None:
     print(f"{'='*60}\n")
 
 
-def run_diagnose(library_path: Path, csv_out_dir: Optional[Path]) -> int:
+def run_diagnose(library_path: Path, csv_out_dir: Path | None) -> int:
     """Open the Serato library read-only and report diagnostics."""
     if not library_path.exists():
         logger.error(f"Serato library not found: {library_path}")
