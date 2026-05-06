@@ -11,10 +11,13 @@ Design Decisions:
 """
 
 import argparse
+import csv
 import logging
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -874,6 +877,859 @@ def execute_sync(
     return True
 
 
+@dataclass
+class DiagnosticReport:
+    """Read-only summary of Serato library health."""
+    library_path: Path
+    total_assets: int
+    missing_assets: int
+    corrupt_assets: int
+    distinct_file_names: int
+    distinct_paths: int
+    by_location: list[tuple[int, int, int, int]]  # (location_id, total, missing, corrupt)
+    duplicate_metadata_groups: int
+    duplicate_metadata_excess_rows: int
+
+
+def get_default_serato_library_path() -> Path:
+    """Get the default Serato master.sqlite path for the current platform."""
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library" / "Application Support" / "Serato" / "Library" / "master.sqlite"
+        )
+    elif sys.platform == "win32":
+        return (
+            Path(os.environ.get("LOCALAPPDATA", ""))
+            / "Serato" / "Library" / "master.sqlite"
+        )
+    else:
+        return Path.home() / ".serato" / "Library" / "master.sqlite"
+
+
+def connect_serato_library_readonly(library_path: Path) -> sqlite3.Connection:
+    """Open Serato's master.sqlite in read-only mode.
+
+    Safe to use while Serato DJ Pro is running: WAL mode plus a busy
+    timeout means we coexist with the live writer rather than blocking it.
+    """
+    uri = f"file:{library_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def gather_diagnostics(conn: sqlite3.Connection) -> DiagnosticReport:
+    """Run read-only counts against an open Serato library connection."""
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM asset")
+    total = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM asset WHERE is_missing = 1")
+    missing = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM asset WHERE is_corrupt = 1")
+    corrupt = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(DISTINCT file_name) FROM asset "
+        "WHERE file_name IS NOT NULL AND file_name != ''"
+    )
+    distinct_filenames = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(DISTINCT portable_id) FROM asset")
+    distinct_paths = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT location_id, COUNT(*), COALESCE(SUM(is_missing), 0), "
+        "       COALESCE(SUM(is_corrupt), 0) "
+        "FROM asset GROUP BY location_id ORDER BY location_id"
+    )
+    by_location = [tuple(row) for row in cur.fetchall()]
+
+    # Strong duplicate key: same artist + name + length within a location.
+    # Filename-only would lump every "Track01.mp3" together — useless noise.
+    cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(n - 1), 0) FROM ("
+        "  SELECT COUNT(*) AS n FROM asset "
+        "  WHERE artist != '' AND name != '' AND length_ms IS NOT NULL "
+        "  GROUP BY location_id, artist, name, length_ms HAVING COUNT(*) > 1"
+        ")"
+    )
+    dup_groups, dup_excess = cur.fetchone()
+
+    # library_path is filled in by the caller (it owns the connection)
+    return DiagnosticReport(
+        library_path=Path(""),
+        total_assets=total,
+        missing_assets=missing,
+        corrupt_assets=corrupt,
+        distinct_file_names=distinct_filenames,
+        distinct_paths=distinct_paths,
+        by_location=by_location,
+        duplicate_metadata_groups=dup_groups,
+        duplicate_metadata_excess_rows=dup_excess,
+    )
+
+
+def export_missing_assets_csv(conn: sqlite3.Connection, out_path: Path) -> int:
+    """Write a CSV row for every asset flagged is_missing. Returns row count."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, location_id, file_name, portable_id, artist, name, album, "
+        "       is_corrupt "
+        "FROM asset WHERE is_missing = 1 "
+        "ORDER BY location_id, portable_id"
+    )
+    written = 0
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id", "location_id", "file_name", "portable_id",
+            "artist", "name", "album", "is_corrupt",
+        ])
+        for row in cur:
+            writer.writerow(list(row))
+            written += 1
+    return written
+
+
+def export_duplicate_tracks_csv(conn: sqlite3.Connection, out_path: Path) -> int:
+    """Write a CSV row for every (artist, name, length) duplicate group.
+
+    A "duplicate" here is asset rows sharing the same artist, name, and
+    length_ms within a location — i.e. the same song listed multiple times,
+    typically with different file paths or filenames. Filename-only matching
+    was rejected because generic names ("Track01.mp3") collapse unrelated
+    albums into spurious duplicate groups.
+
+    Each row includes the duplicate count, pipe-delimited paths, and how
+    many of the duplicates Serato has flagged as missing.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT location_id, artist, name, length_ms, COUNT(*) AS dup_count, "
+        "       GROUP_CONCAT(portable_id, '|') AS paths, "
+        "       COALESCE(SUM(is_missing), 0) AS n_missing "
+        "FROM asset "
+        "WHERE artist != '' AND name != '' AND length_ms IS NOT NULL "
+        "GROUP BY location_id, artist, name, length_ms "
+        "HAVING COUNT(*) > 1 "
+        "ORDER BY dup_count DESC, artist, name"
+    )
+    written = 0
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "location_id", "artist", "name", "length_ms",
+            "dup_count", "paths", "n_missing",
+        ])
+        for row in cur:
+            writer.writerow(list(row))
+            written += 1
+    return written
+
+
+def print_diagnostic_report(report: DiagnosticReport) -> None:
+    """Print a human-readable diagnostic summary to stdout."""
+    print(f"\n{'='*60}")
+    print("SERATO LIBRARY DIAGNOSTIC")
+    print(f"{'='*60}")
+    print(f"Library:           {report.library_path}")
+    print(f"{'-'*60}")
+    print(f"Total asset rows:  {report.total_assets:>10,}")
+    print(f"Distinct paths:    {report.distinct_paths:>10,}")
+    print(f"Distinct filenames:{report.distinct_file_names:>10,}")
+    print(f"Missing (warning): {report.missing_assets:>10,}")
+    print(f"Corrupt:           {report.corrupt_assets:>10,}")
+    print(f"{'-'*60}")
+    print("By location:")
+    print(f"  {'location_id':>11}  {'total':>10}  {'missing':>10}  {'corrupt':>10}")
+    for loc_id, total, n_missing, n_corrupt in report.by_location:
+        print(f"  {loc_id:>11}  {total:>10,}  {n_missing:>10,}  {n_corrupt:>10,}")
+    print(f"{'-'*60}")
+    print("Duplicate tracks (same artist + name + length):")
+    print(f"  Duplicate groups:        {report.duplicate_metadata_groups:>10,}")
+    print(f"  Excess rows over unique: {report.duplicate_metadata_excess_rows:>10,}")
+    print(f"{'='*60}\n")
+
+
+@dataclass
+class PathVerificationReport:
+    """Result of checking every asset's path against the filesystem."""
+    total_checked: int
+    healthy: int
+    auto_fix: int
+    ambiguous: int
+    orphan: int
+
+
+def portable_id_to_fs_path(portable_id: str) -> str:
+    """Convert a Serato portable_id (often missing leading slash) to an absolute path."""
+    return portable_id if portable_id.startswith("/") else "/" + portable_id
+
+
+def fs_path_to_portable_id(fs_path: str, leading_slash: bool) -> str:
+    """Render a filesystem path back into Serato's portable_id format.
+
+    The codebase has historically stripped the leading slash to match
+    Serato's internal convention (see resolve_track_path). Mirror the
+    format of the asset row we are repairing so we don't introduce a
+    third path variant.
+    """
+    if leading_slash:
+        return fs_path if fs_path.startswith("/") else "/" + fs_path
+    return fs_path.lstrip("/")
+
+
+def build_filesystem_index(
+    music_root: Path,
+    extensions: frozenset[str],
+) -> dict[str, list[str]]:
+    """Walk music_root once, returning filename.lower() -> list of absolute paths."""
+    index: dict[str, list[str]] = {}
+    for dirpath, dirnames, filenames in os.walk(str(music_root)):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for fname in filenames:
+            if fname.startswith("."):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            if ext not in extensions:
+                continue
+            index.setdefault(fname.lower(), []).append(
+                os.path.join(dirpath, fname)
+            )
+    return index
+
+
+def score_candidate(broken_path: str, candidate: str) -> int:
+    """Count trailing parent-directory components shared between broken and candidate.
+
+    Higher is better. Used to prefer relinking to a candidate that lives
+    in the same playlist sub-folder as the broken path (so an "Acid Jazz"
+    entry doesn't silently relink to a "World Music" copy when both exist).
+    """
+    broken_parents = os.path.dirname(broken_path).split(os.sep)
+    cand_parents = os.path.dirname(candidate).split(os.sep)
+    score = 0
+    for b, c in zip(reversed(broken_parents), reversed(cand_parents)):
+        if b == c:
+            score += 1
+        else:
+            break
+    return score
+
+
+def find_candidates(
+    broken_path: str,
+    file_size_db: Optional[int],
+    fs_index: dict[str, list[str]],
+) -> list[str]:
+    """Return candidates ordered by ancestry-similarity (best first).
+
+    Filters by on-disk file_size only when (a) we have a recorded size
+    and (b) there is more than one candidate sharing the filename. This
+    avoids stat-ing every candidate when filename alone is decisive.
+    """
+    fname = os.path.basename(broken_path).lower()
+    candidates = list(fs_index.get(fname, []))
+    if not candidates:
+        return []
+    if len(candidates) > 1 and file_size_db:
+        size_matches = []
+        for c in candidates:
+            try:
+                if os.stat(c).st_size == file_size_db:
+                    size_matches.append(c)
+            except OSError:
+                pass
+        if size_matches:
+            candidates = size_matches
+    candidates.sort(key=lambda p: score_candidate(broken_path, p), reverse=True)
+    return candidates
+
+
+def classify_candidates(
+    broken_path: str,
+    candidates: list[str],
+) -> str:
+    """Label the repair confidence: 'auto', 'ambiguous', or 'orphan'."""
+    if not candidates:
+        return "orphan"
+    if len(candidates) == 1:
+        return "auto"
+    top_score = score_candidate(broken_path, candidates[0])
+    runner_score = score_candidate(broken_path, candidates[1])
+    return "auto" if top_score > runner_score else "ambiguous"
+
+
+def verify_assets_against_filesystem(
+    conn: sqlite3.Connection,
+    fs_index: dict[str, list[str]],
+    csv_path: Optional[Path],
+    progress_every: int = 50000,
+) -> PathVerificationReport:
+    """Stream every asset row, check path existence, classify broken rows."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, location_id, portable_id, file_name, file_size, "
+        "       artist, name FROM asset ORDER BY id"
+    )
+
+    healthy = auto_fix = ambiguous = orphan = total = 0
+
+    csv_file = None
+    csv_writer = None
+    if csv_path is not None:
+        csv_file = csv_path.open("w", newline="", encoding="utf-8")
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerow([
+            "asset_id", "location_id", "old_portable_id",
+            "proposed_new_portable_id", "confidence",
+            "candidate_count", "alternate_paths",
+            "file_size_db", "file_name", "artist", "name",
+        ])
+
+    next_progress = progress_every
+    try:
+        for row in cur:
+            total += 1
+            portable_id = row["portable_id"] or ""
+            fs_path = portable_id_to_fs_path(portable_id)
+
+            if os.path.exists(fs_path):
+                healthy += 1
+            else:
+                file_size_db = row["file_size"]
+                candidates = find_candidates(fs_path, file_size_db, fs_index)
+                confidence = classify_candidates(fs_path, candidates)
+
+                if confidence == "orphan":
+                    orphan += 1
+                    proposed = ""
+                elif confidence == "auto":
+                    auto_fix += 1
+                    proposed = fs_path_to_portable_id(
+                        candidates[0], leading_slash=portable_id.startswith("/")
+                    )
+                else:
+                    ambiguous += 1
+                    proposed = fs_path_to_portable_id(
+                        candidates[0], leading_slash=portable_id.startswith("/")
+                    )
+
+                if csv_writer is not None:
+                    alternates = "|".join(
+                        fs_path_to_portable_id(p, portable_id.startswith("/"))
+                        for p in candidates[1:6]
+                    )
+                    csv_writer.writerow([
+                        row["id"], row["location_id"], portable_id,
+                        proposed, confidence, len(candidates), alternates,
+                        file_size_db, row["file_name"],
+                        row["artist"], row["name"],
+                    ])
+
+            if total >= next_progress:
+                broken = auto_fix + ambiguous + orphan
+                print(f"  checked {total:>10,}  healthy {healthy:>10,}  broken {broken:>7,}")
+                next_progress += progress_every
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+
+    return PathVerificationReport(
+        total_checked=total,
+        healthy=healthy,
+        auto_fix=auto_fix,
+        ambiguous=ambiguous,
+        orphan=orphan,
+    )
+
+
+def print_path_verification_report(report: PathVerificationReport) -> None:
+    """Print a verify-paths summary to stdout."""
+    broken = report.auto_fix + report.ambiguous + report.orphan
+    print(f"\n{'='*60}")
+    print("PATH VERIFICATION REPORT")
+    print(f"{'='*60}")
+    print(f"Total assets checked:  {report.total_checked:>10,}")
+    print(f"Healthy (path exists): {report.healthy:>10,}")
+    print(f"Broken total:          {broken:>10,}")
+    print(f"  auto-fix candidate:  {report.auto_fix:>10,}")
+    print(f"  ambiguous:           {report.ambiguous:>10,}")
+    print(f"  orphan (no match):   {report.orphan:>10,}")
+    print(f"{'='*60}\n")
+
+
+def run_verify_paths(
+    library_path: Path,
+    music_root: Path,
+    extensions: frozenset[str],
+    csv_out_dir: Optional[Path],
+) -> int:
+    """Read-only check that every asset path resolves; emit repair candidates."""
+    if not library_path.exists():
+        logger.error(f"Serato library not found: {library_path}")
+        return 1
+    if not music_root.exists() or not music_root.is_dir():
+        logger.error(f"Music root not found or not a directory: {music_root}")
+        return 1
+
+    print(f"Indexing files under: {music_root}")
+    fs_index = build_filesystem_index(music_root, extensions)
+    total_files = sum(len(paths) for paths in fs_index.values())
+    print(f"  {total_files:,} files across {len(fs_index):,} unique filenames\n")
+
+    csv_path: Optional[Path] = None
+    if csv_out_dir is not None:
+        csv_out_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = csv_out_dir / "path-fixes.csv"
+
+    print(f"Verifying assets in: {library_path}")
+    conn = connect_serato_library_readonly(library_path)
+    try:
+        report = verify_assets_against_filesystem(conn, fs_index, csv_path)
+    finally:
+        conn.close()
+
+    print_path_verification_report(report)
+    if csv_path is not None:
+        print(f"Repair candidates: {csv_path}\n")
+    return 0
+
+
+@dataclass
+class FixStats:
+    """Counters reported after fix-paths runs."""
+    total_csv_rows: int = 0
+    updated: int = 0
+    merged: int = 0
+    orphans_deleted: int = 0
+    skipped_ambiguous: int = 0
+    skipped_keep_orphans: int = 0
+    skipped_no_proposal: int = 0
+    skipped_repair_only_merge: int = 0
+    skipped_stale_csv: int = 0
+    skipped_unknown_confidence: int = 0
+
+
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_serato_running() -> bool:
+    """Return True if a Serato DJ Pro process is found via pgrep.
+
+    Used as a guard before opening master.sqlite for writing.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Serato DJ Pro.app"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # pgrep missing or hung — can't confirm. Treat as "not running" so the
+        # caller doesn't refuse to act; the SQLite open will surface conflicts
+        # if Serato actually has an exclusive lock.
+        return False
+    return result.returncode == 0
+
+
+def backup_serato_library(library_path: Path) -> Path:
+    """Create a clean snapshot of master.sqlite via SQLite's Backup API.
+
+    Using the Backup API (rather than copying the file) yields a consistent
+    snapshot regardless of whether the WAL has been checkpointed.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
+
+    src = sqlite3.connect(str(library_path))
+    try:
+        dst = sqlite3.connect(str(backup_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    return backup_path
+
+
+def get_asset_referencing_columns(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str, bool]]:
+    """Find every column referencing asset.id (formal or informal).
+
+    Returns triples ``(table, column, has_cascade_fk)``. The third flag is
+    True when the column has a FOREIGN KEY to asset.id with ON DELETE
+    CASCADE — fix-paths can rely on the engine to clean up after a
+    ``DELETE FROM asset``. False means the reference is informal (column
+    named asset_id but no FK) or the FK action is not CASCADE — in that
+    case fix-paths must DELETE leftover dependent rows itself.
+
+    Real Serato schemas have asset_id columns with NO foreign key on
+    several important tables (container_asset, anonymous_table_0/1/2,
+    static_selection_asset). Trusting only formal FKs leaves dangling
+    rows behind on asset DELETE and triggers Serato's "Operation failed"
+    error on next launch.
+    """
+    refs: list[tuple[str, str, bool]] = []
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    for t in tables:
+        if t == "asset" or not _SAFE_IDENT.match(t):
+            continue
+
+        cascade_fk_cols: set[str] = set()
+        for fk in cur.execute(f"PRAGMA foreign_key_list({t})").fetchall():
+            # fk: (id, seq, table, from, to, on_update, on_delete, match)
+            if (
+                fk[2] == "asset"
+                and fk[4] == "id"
+                and fk[6] == "CASCADE"
+                and _SAFE_IDENT.match(fk[3])
+            ):
+                cascade_fk_cols.add(fk[3])
+                refs.append((t, fk[3], True))
+
+        for col in cur.execute(f"PRAGMA table_info({t})").fetchall():
+            cname = col[1]
+            if cname == "asset_id" and _SAFE_IDENT.match(cname) and cname not in cascade_fk_cols:
+                refs.append((t, cname, False))
+    return refs
+
+
+# Backwards-compatible alias for tests that still import the old name.
+def get_asset_referencing_tables(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    return [(t, c) for (t, c, _) in get_asset_referencing_columns(conn)]
+
+
+def _load_asset_maps(
+    conn: sqlite3.Connection,
+) -> tuple[dict[int, str], dict[tuple[int, str], int]]:
+    """Snapshot the asset table into two in-memory lookup dicts.
+
+    Per-row SQL lookups are catastrophically slow for an 800k-row CSV
+    because asset's UNIQUE index on (location_id, portable_id) uses
+    COLLATE NOCASE, so a default-collation equality filter falls back
+    to a full scan. One up-front SELECT plus dict lookups is orders of
+    magnitude faster, and tolerates contention from a running Serato
+    much better.
+    """
+    id_to_portable: dict[int, str] = {}
+    path_to_id: dict[tuple[int, str], int] = {}
+    for asset_id, loc_id, pid in conn.execute(
+        "SELECT id, location_id, portable_id FROM asset"
+    ):
+        id_to_portable[asset_id] = pid
+        # Lowercase key mirrors the COLLATE NOCASE uniqueness Serato uses
+        path_to_id[(loc_id, pid.lower())] = asset_id
+    return id_to_portable, path_to_id
+
+
+def _process_fix_row(
+    conn: sqlite3.Connection,
+    row: dict,
+    ref_columns: list[tuple[str, str, bool]],
+    stats: FixStats,
+    audit_writer,
+    id_to_portable: dict[int, str],
+    path_to_id: dict[tuple[int, str], int],
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+) -> None:
+    """Apply (or dry-run) a single CSV row of repair instructions.
+
+    Maintains the in-memory maps as it goes so later rows see the
+    consequences of earlier rows (path freed by a delete, claimed by
+    an update, etc.).
+    """
+    asset_id = int(row["asset_id"])
+    location_id = int(row["location_id"])
+    old_path = row["old_portable_id"]
+    proposed = row.get("proposed_new_portable_id", "")
+    confidence = row["confidence"]
+
+    def log(action: str, merged_into: str = "") -> None:
+        if audit_writer is not None:
+            audit_writer.writerow([
+                asset_id, old_path, proposed, action, merged_into,
+            ])
+
+    # Sanity check: the broken row must still exist with the path we recorded.
+    actual = id_to_portable.get(asset_id)
+    if actual is None or actual != old_path:
+        stats.skipped_stale_csv += 1
+        log("skipped_stale_csv")
+        return
+
+    if confidence == "orphan":
+        if keep_orphans:
+            stats.skipped_keep_orphans += 1
+            log("skipped_keep_orphans")
+            return
+        if apply:
+            # Manually remove rows in informal asset_id columns (no FK
+            # CASCADE). Cascade-FK tables clean themselves up on the asset
+            # DELETE below.
+            for table, column, has_cascade in ref_columns:
+                if not has_cascade:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE {column} = ?",
+                        (asset_id,),
+                    )
+            conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
+        # Update maps either way so dry-run stats stay consistent
+        id_to_portable.pop(asset_id, None)
+        path_to_id.pop((location_id, old_path.lower()), None)
+        stats.orphans_deleted += 1
+        log("orphan_deleted")
+        return
+
+    if confidence == "ambiguous" and not ambiguous_too:
+        stats.skipped_ambiguous += 1
+        log("skipped_ambiguous")
+        return
+
+    if confidence not in ("auto", "ambiguous"):
+        stats.skipped_unknown_confidence += 1
+        log("skipped_unknown_confidence")
+        return
+
+    if not proposed:
+        stats.skipped_no_proposal += 1
+        log("skipped_no_proposal")
+        return
+
+    existing_id = path_to_id.get((location_id, proposed.lower()))
+    if existing_id == asset_id:
+        # Map already reports the asset under the proposed path (e.g. an
+        # earlier row updated it). Treat as a no-op skip.
+        existing_id = None
+
+    if existing_id is None:
+        if apply:
+            conn.execute(
+                "UPDATE asset SET portable_id = ? WHERE id = ?",
+                (proposed, asset_id),
+            )
+        # Maintain maps
+        id_to_portable[asset_id] = proposed
+        path_to_id.pop((location_id, old_path.lower()), None)
+        path_to_id[(location_id, proposed.lower())] = asset_id
+        stats.updated += 1
+        log("updated")
+        return
+
+    if repair_only:
+        stats.skipped_repair_only_merge += 1
+        log("skipped_repair_only_merge", str(existing_id))
+        return
+
+    if apply:
+        for table, column, has_cascade in ref_columns:
+            # UPDATE OR IGNORE: re-parent the row to the healthy asset
+            # where possible. If the dependent table has a UNIQUE on
+            # (other_id, asset_id) and the healthy id is already present,
+            # the broken-side row is left alone here.
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
+                (existing_id, asset_id),
+            )
+            if not has_cascade:
+                # No CASCADE will sweep up the rows UPDATE OR IGNORE
+                # skipped — delete them explicitly so the asset DELETE
+                # doesn't leave dangling references that crash Serato's
+                # next library scan.
+                conn.execute(
+                    f"DELETE FROM {table} WHERE {column} = ?",
+                    (asset_id,),
+                )
+        conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
+    # Maintain maps
+    id_to_portable.pop(asset_id, None)
+    path_to_id.pop((location_id, old_path.lower()), None)
+    # The (location_id, proposed_lower) -> existing_id mapping stays as-is.
+    stats.merged += 1
+    log("merged", str(existing_id))
+
+
+def apply_fixes(
+    conn: sqlite3.Connection,
+    csv_path: Path,
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+    audit_log_path: Optional[Path],
+    progress_every: int = 50000,
+) -> FixStats:
+    """Stream the path-fixes CSV and apply each row's repair (or dry-run)."""
+    stats = FixStats()
+    ref_columns = get_asset_referencing_columns(conn)
+
+    print("  loading asset table into memory...")
+    id_to_portable, path_to_id = _load_asset_maps(conn)
+    print(f"  loaded {len(id_to_portable):,} assets")
+
+    audit_file = None
+    audit_writer = None
+    if audit_log_path is not None:
+        audit_file = audit_log_path.open("w", newline="", encoding="utf-8")
+        audit_writer = csv.writer(audit_file)
+        audit_writer.writerow([
+            "asset_id", "old_portable_id", "proposed_new_portable_id",
+            "action", "merged_into_id",
+        ])
+
+    next_progress = progress_every
+    try:
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                stats.total_csv_rows += 1
+                _process_fix_row(
+                    conn, row, ref_columns, stats, audit_writer,
+                    id_to_portable, path_to_id,
+                    apply=apply,
+                    keep_orphans=keep_orphans,
+                    ambiguous_too=ambiguous_too,
+                    repair_only=repair_only,
+                )
+                if stats.total_csv_rows >= next_progress:
+                    print(
+                        f"  processed {stats.total_csv_rows:>8,}  "
+                        f"updated {stats.updated:>7,}  "
+                        f"merged {stats.merged:>7,}  "
+                        f"orphans {stats.orphans_deleted:>6,}"
+                    )
+                    next_progress += progress_every
+    finally:
+        if audit_file is not None:
+            audit_file.close()
+
+    return stats
+
+
+def print_fix_stats(stats: FixStats, dry_run: bool) -> None:
+    """Print a summary of the fix-paths run."""
+    label = "DRY-RUN" if dry_run else "APPLIED"
+    print(f"\n{'='*60}")
+    print(f"FIX-PATHS {label}")
+    print(f"{'='*60}")
+    print(f"CSV rows processed:               {stats.total_csv_rows:>10,}")
+    print(f"  paths updated:                  {stats.updated:>10,}")
+    print(f"  rows merged into existing:      {stats.merged:>10,}")
+    print(f"  orphans deleted:                {stats.orphans_deleted:>10,}")
+    print(f"  skipped (ambiguous):            {stats.skipped_ambiguous:>10,}")
+    print(f"  skipped (kept orphans):         {stats.skipped_keep_orphans:>10,}")
+    print(f"  skipped (no proposed path):     {stats.skipped_no_proposal:>10,}")
+    print(f"  skipped (repair-only blocked merge): {stats.skipped_repair_only_merge:>5,}")
+    print(f"  skipped (CSV stale):            {stats.skipped_stale_csv:>10,}")
+    print(f"  skipped (unknown confidence):   {stats.skipped_unknown_confidence:>10,}")
+    print(f"{'='*60}\n")
+
+
+def run_fix_paths(
+    library_path: Path,
+    csv_path: Path,
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+    audit_log_path: Optional[Path],
+) -> int:
+    """Apply (or dry-run) repairs from a path-fixes.csv against master.sqlite."""
+    if not library_path.exists():
+        logger.error(f"Serato library not found: {library_path}")
+        return 1
+    if not csv_path.exists():
+        logger.error(f"Path-fixes CSV not found: {csv_path}")
+        return 1
+
+    if apply and is_serato_running():
+        logger.error(
+            "Serato DJ Pro appears to be running. Quit it (Cmd+Q) and rerun."
+        )
+        return 1
+
+    if apply:
+        backup = backup_serato_library(library_path)
+        print(f"Backup: {backup}")
+        # isolation_level=None lets us drive transactions explicitly so a single
+        # BEGIN ... COMMIT spans the whole run and rolls back atomically on error.
+        conn = sqlite3.connect(str(library_path), isolation_level=None)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+    else:
+        conn = connect_serato_library_readonly(library_path)
+
+    try:
+        try:
+            stats = apply_fixes(
+                conn, csv_path,
+                apply=apply,
+                keep_orphans=keep_orphans,
+                ambiguous_too=ambiguous_too,
+                repair_only=repair_only,
+                audit_log_path=audit_log_path,
+            )
+        except Exception:
+            if apply:
+                conn.execute("ROLLBACK")
+            raise
+        if apply:
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    print_fix_stats(stats, dry_run=not apply)
+    if audit_log_path is not None:
+        print(f"Audit log: {audit_log_path}\n")
+    return 0
+
+
+def run_diagnose(library_path: Path, csv_out_dir: Optional[Path]) -> int:
+    """Open the Serato library read-only and report diagnostics."""
+    if not library_path.exists():
+        logger.error(f"Serato library not found: {library_path}")
+        return 1
+
+    conn = connect_serato_library_readonly(library_path)
+    try:
+        report = gather_diagnostics(conn)
+        report.library_path = library_path
+        print_diagnostic_report(report)
+
+        if csv_out_dir is not None:
+            csv_out_dir.mkdir(parents=True, exist_ok=True)
+            missing_path = csv_out_dir / "missing-assets.csv"
+            dupes_path = csv_out_dir / "duplicate-tracks.csv"
+            n_missing = export_missing_assets_csv(conn, missing_path)
+            n_dupes = export_duplicate_tracks_csv(conn, dupes_path)
+            print(f"Wrote {n_missing:,} missing-asset rows to: {missing_path}")
+            print(f"Wrote {n_dupes:,} duplicate-track groups to: {dupes_path}")
+            print()
+    finally:
+        conn.close()
+
+    return 0
+
+
 def validate_music_root(raw_path: Path) -> Optional[Path]:
     """Resolve and validate a music root path. Returns resolved Path or None."""
     resolved = raw_path.expanduser().resolve()
@@ -988,6 +1844,99 @@ Safety:
         help="Show detailed output including track names"
     )
 
+    # fix-paths command - apply repairs from a path-fixes.csv
+    fix_parser = subparsers.add_parser(
+        "fix-paths",
+        help="Apply repairs from path-fixes.csv to master.sqlite (Serato must be closed)"
+    )
+    fix_parser.add_argument(
+        "--from-csv",
+        type=Path,
+        required=True,
+        help="Path-fixes CSV (produced by verify-paths)"
+    )
+    fix_parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})"
+    )
+    fix_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write changes (default is dry-run)"
+    )
+    fix_parser.add_argument(
+        "--keep-orphans",
+        action="store_true",
+        help="Skip orphan rows instead of deleting them"
+    )
+    fix_parser.add_argument(
+        "--ambiguous-too",
+        action="store_true",
+        help="Apply ambiguous rows using whatever path is in the CSV "
+             "(only safe if you've reviewed the CSV)"
+    )
+    fix_parser.add_argument(
+        "--repair-only",
+        action="store_true",
+        help="Skip merges; only repair rows whose proposed path is unclaimed"
+    )
+    fix_parser.add_argument(
+        "--audit-log",
+        type=Path,
+        default=None,
+        help="Path to write the per-row audit CSV (default: alongside --from-csv)"
+    )
+
+    # verify-paths command - check every asset path resolves on disk
+    verify_parser = subparsers.add_parser(
+        "verify-paths",
+        help="Check every asset's path against the filesystem; emit repair candidates"
+    )
+    verify_parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})"
+    )
+    verify_parser.add_argument(
+        "--music-root", "-m",
+        type=Path,
+        required=True,
+        help="Root folder containing music (used to locate replacement files)"
+    )
+    verify_parser.add_argument(
+        "--extensions", "-e",
+        type=str,
+        default="mp3,m4a,aiff,aif,wav,flac",
+        help="Comma-separated audio extensions to index (default: mp3,m4a,aiff,aif,wav,flac)"
+    )
+    verify_parser.add_argument(
+        "--csv-out",
+        type=Path,
+        default=None,
+        help="Directory to write path-fixes.csv (optional)"
+    )
+
+    # diagnose command - read-only health check of Serato library
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="Read-only diagnostic of the Serato library (missing tracks, duplicate paths)"
+    )
+    diagnose_parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})"
+    )
+    diagnose_parser.add_argument(
+        "--csv-out",
+        type=Path,
+        default=None,
+        help="Directory to write missing-assets.csv and duplicate-paths.csv (optional)"
+    )
+
     # guide command - generate manual crate creation instructions
     guide_parser = subparsers.add_parser(
         "guide",
@@ -1066,6 +2015,62 @@ Safety:
         )
 
         return 0 if success else 1
+
+    elif args.command == "fix-paths":
+        library_path = args.library_path
+        if library_path is None:
+            library_path = get_default_serato_library_path()
+        else:
+            library_path = library_path.expanduser().resolve()
+
+        csv_path = args.from_csv.expanduser().resolve()
+        audit_log = args.audit_log
+        if audit_log is None:
+            audit_log = csv_path.parent / "fix-paths-applied.csv"
+        else:
+            audit_log = audit_log.expanduser().resolve()
+
+        return run_fix_paths(
+            library_path,
+            csv_path,
+            apply=args.apply,
+            keep_orphans=args.keep_orphans,
+            ambiguous_too=args.ambiguous_too,
+            repair_only=args.repair_only,
+            audit_log_path=audit_log,
+        )
+
+    elif args.command == "verify-paths":
+        library_path = args.library_path
+        if library_path is None:
+            library_path = get_default_serato_library_path()
+        else:
+            library_path = library_path.expanduser().resolve()
+
+        music_root = validate_music_root(args.music_root)
+        if music_root is None:
+            return 1
+
+        extensions = parse_extensions(args.extensions)
+
+        csv_out = args.csv_out
+        if csv_out is not None:
+            csv_out = csv_out.expanduser().resolve()
+
+        return run_verify_paths(library_path, music_root, extensions, csv_out)
+
+    elif args.command == "diagnose":
+        library_path = args.library_path
+        if library_path is None:
+            library_path = get_default_serato_library_path()
+        else:
+            library_path = library_path.expanduser().resolve()
+
+        csv_out = args.csv_out
+        if csv_out is not None:
+            csv_out = csv_out.expanduser().resolve()
+
+        return run_diagnose(library_path, csv_out)
 
     elif args.command == "guide":
         music_root = validate_music_root(args.music_root)

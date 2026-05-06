@@ -147,6 +147,92 @@ serato-crates sync --music-root /Volumes/DJUSB/Music --apply --path-mode relativ
 serato-crates sync --music-root ~/Music --extensions mp3,wav --apply
 ```
 
+### Diagnose Library Health
+
+The `diagnose` subcommand performs a **read-only** health check of your
+Serato library, reporting missing tracks (the warning triangle in the
+Serato UI), corrupt assets, and duplicate-track groups (same artist +
+name + length appearing multiple times):
+
+```bash
+# Summary only
+serato-crates diagnose
+
+# Summary plus CSV export of every missing asset and every duplicate group
+serato-crates diagnose --csv-out ~/serato-diag
+
+# Override the library path (default: ~/Library/Application Support/Serato/Library/master.sqlite on macOS)
+serato-crates diagnose --library-path /path/to/master.sqlite
+```
+
+The command opens the database in read-only mode and is safe to run
+while Serato DJ Pro is active. Two CSVs are written when `--csv-out` is
+given:
+
+- `missing-assets.csv` — one row per asset flagged `is_missing` in Serato
+- `duplicate-tracks.csv` — one row per (artist, name, length) group with more than one asset, with all variant paths pipe-delimited
+
+`diagnose` does not modify the database. Use the output to plan any
+subsequent purge.
+
+### Verify Asset Paths Against the Filesystem
+
+`verify-paths` walks your music root once, then checks every asset row
+in `master.sqlite` to confirm its stored path resolves on disk. For each
+broken row it locates candidate replacement files by filename (and, when
+available, narrows by `file_size`) and ranks them by folder-ancestry
+similarity to the broken path so an "Acid Jazz" entry doesn't silently
+relink to a "World" copy when both exist:
+
+```bash
+serato-crates verify-paths -m "$HOME/Music/_DJ MUSIC" --csv-out /tmp/serato-diag
+```
+
+Output is `path-fixes.csv` with one row per broken asset, classified
+`auto` (clear best match), `ambiguous` (tied scores — needs human pick),
+or `orphan` (no matching file anywhere on disk). Read-only — no DB
+changes.
+
+### Repair Broken Asset Paths
+
+After reviewing `path-fixes.csv` (edit ambiguous rows or blank their
+proposed paths to skip them), run `fix-paths` to apply the repairs:
+
+```bash
+# Dry-run (default) — print what would change
+serato-crates fix-paths --from-csv /tmp/serato-diag/path-fixes.csv
+
+# Apply for real (Serato DJ Pro must be quit first)
+serato-crates fix-paths --from-csv /tmp/serato-diag/path-fixes.csv --apply
+```
+
+Behaviour:
+
+- Refuses to run with `--apply` if Serato DJ Pro is running.
+- Backs up `master.sqlite` to `master.sqlite.BACKUP.<timestamp>` via
+  SQLite's Backup API before any writes.
+- Wraps everything in a single transaction; any error rolls back fully.
+- For each broken row:
+  - `auto` with proposed path **unclaimed**: UPDATE the row's path.
+  - `auto` with proposed path **already taken** by a healthy row:
+    re-parent the broken row's `container_asset` / `selection_asset`
+    memberships to the healthy row (skipping crates where the healthy
+    row is already a member), then DELETE the broken row.
+  - `orphan`: DELETE the asset row (with `--keep-orphans` to preserve).
+  - `ambiguous`: skip by default (use `--ambiguous-too` to apply
+    whatever is in the CSV's `proposed_new_portable_id` column —
+    only safe if you've reviewed the file).
+- Writes `fix-paths-applied.csv` next to the input CSV with one audit
+  row per processed asset.
+
+Flags:
+
+- `--apply` — actually write (default is dry-run)
+- `--keep-orphans` — leave orphan rows alone
+- `--ambiguous-too` — trust the CSV's proposed path for ambiguous rows
+- `--repair-only` — skip merges; only handle pure path UPDATEs (rare)
+- `--audit-log PATH` — override the default audit CSV location
+
 ## Verification Checklist
 
 After running with `--apply`, verify in Serato DJ Pro 4.0.2:
