@@ -2077,10 +2077,17 @@ Safety:
         help="Directory to write missing-assets.csv and duplicate-paths.csv (optional)"
     )
 
-    # guide command - generate manual crate creation instructions
+    # guide command - generate manual crate creation instructions.
+    # Predates `sync`, kept for users who prefer to drag-and-drop folders
+    # into Serato themselves rather than have crates written for them, or
+    # who want a printable reference of their folder hierarchy.
     guide_parser = subparsers.add_parser(
         "guide",
-        help="Generate guide for manually creating crates in Serato"
+        help=(
+            "Print step-by-step instructions for manually creating crates "
+            "in Serato (no DB writes; for users who prefer drag-and-drop "
+            "to automated sync)"
+        ),
     )
     guide_parser.add_argument(
         "--music-root", "-m",
