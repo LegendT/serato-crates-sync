@@ -1763,6 +1763,8 @@ def parse_extensions(ext_str: str) -> frozenset[str]:
 
 def main():
     """Main CLI entrypoint."""
+    from . import __version__
+
     parser = argparse.ArgumentParser(
         prog="serato-crates",
         description=(
@@ -1797,6 +1799,12 @@ Safety:
                  Serato is detected, snapshots master.sqlite via the
                  SQLite Backup API, and runs in one transaction.
 """
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
