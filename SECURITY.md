@@ -49,16 +49,20 @@ Out of scope:
 `fix-paths --apply` enforces these invariants on every run:
 
 1. Refuses to run if Serato DJ Pro / Studio / Lite is detected via
-   `pgrep`, or if another writer holds the database lock
-   (`BEGIN IMMEDIATE`).
+   `pgrep` (macOS), or if another writer holds the database lock
+   (`BEGIN IMMEDIATE`). On platforms without `pgrep` the lock check
+   is the only guard.
 2. Backs up `master.sqlite` via SQLite's Backup API and verifies the
    snapshot with `PRAGMA integrity_check` before any writes.
 3. Verifies `PRAGMA foreign_keys` engaged before relying on cascade
    behaviour.
 4. Wraps everything in a single transaction; rolls back on any error.
-5. Audit log is written to a `.inprogress` tmp file and atomic-renamed
+5. Runs a WAL checkpoint after commit so a downstream copy of
+   `master.sqlite` (without the `-wal` / `-shm` siblings) reflects
+   the fix.
+6. Audit log is written to a `.inprogress` tmp file and atomic-renamed
    to its final path only after a successful commit.
-6. Cleans up rows in informal `asset_id` columns that won't be swept
+7. Cleans up rows in informal `asset_id` columns that won't be swept
    by ON DELETE CASCADE.
 
 Regressions in any of these are treated as security issues.

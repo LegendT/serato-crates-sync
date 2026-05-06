@@ -229,7 +229,7 @@ Safety:
     # diagnose command
     diagnose_parser = subparsers.add_parser(
         "diagnose",
-        help="Read-only diagnostic of the Serato library (missing tracks, duplicate paths)",
+        help="Read-only diagnostic of the Serato library (missing tracks, duplicate tracks)",
     )
     diagnose_parser.add_argument(
         "--library-path",
@@ -241,7 +241,7 @@ Safety:
         "--csv-out",
         type=Path,
         default=None,
-        help="Directory to write missing-assets.csv and duplicate-paths.csv (optional)",
+        help="Directory to write missing-assets.csv and duplicate-tracks.csv (optional)",
     )
 
     # guide command — predates `sync`, kept for users who prefer to

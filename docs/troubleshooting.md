@@ -27,7 +27,8 @@ Happens when Serato's cache contains old crate data. Solution:
 1. Make sure Serato was **completely closed** before running the tool.
 2. Check that `--serato-root` points to the correct folder.
 3. Verify crate files were created: `ls ~/Music/_Serato_/Subcrates/`.
-4. Try running with `--clean` to clear all caches.
+4. Try running with `--clean` to wipe and rewrite `.crate` files
+   from scratch.
 
 ## Tracks show as missing in Serato
 
@@ -77,8 +78,12 @@ reports it for unrelated reasons:
 
 ## Tool can't find serato-crate
 
+`serato-crate` is a declared dependency of this project — if Python
+can't find it, your install probably didn't pull dependencies in.
+Reinstall the project:
+
 ```bash
-pip install serato-crate
+pip install -e .
 ```
 
 ## How to roll back

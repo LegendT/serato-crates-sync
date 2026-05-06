@@ -17,11 +17,14 @@ pip install -e ".[dev]"
 ## Running tests
 
 ```bash
-pytest -q
+pytest -q                                                  # full suite
+pytest --cov=serato_crates_sync --cov-report=term-missing  # with coverage
+ruff check src/ tests/                                     # lint
 ```
 
-CI runs the same suite on Ubuntu and macOS across Python 3.10–3.13. If
-your change passes locally on macOS, it will almost always pass CI.
+CI runs the same suite on Ubuntu and macOS across Python 3.10–3.13,
+plus a separate `ruff` lint job. If your change passes locally on
+macOS, it will almost always pass CI.
 
 ## Test conventions
 
@@ -34,14 +37,15 @@ Tests live in `tests/` and follow the per-feature split of the source:
 - `test_fix_paths.py` — repair logic, both the merge and orphan paths.
 - `test_cli_smoke.py` — end-to-end `main()` invocations per subcommand.
 
-Two synthetic SQLite schemas are used:
+Two synthetic SQLite schemas are used, both defined in
+`tests/_schemas.py`:
 
-- `IDEALISED_SCHEMA` (in `test_fix_paths.py`) — every reference to
-  `asset.id` has a formal `FOREIGN KEY` with `ON DELETE CASCADE`. Tests
-  the cascade path in isolation.
-- `INFORMAL_SCHEMA` (in `test_fix_paths.py`) — `container_asset.asset_id`
-  has no foreign key, mirroring the real Serato shape that bit us in
-  production. New tests for repair behaviour should prefer this one.
+- `IDEALISED_SCHEMA` — every reference to `asset.id` has a formal
+  `FOREIGN KEY` with `ON DELETE CASCADE`. Tests the cascade path in
+  isolation.
+- `INFORMAL_SCHEMA` — `container_asset.asset_id` has no foreign key,
+  mirroring the real Serato shape that bit us in production. New
+  tests for repair behaviour should prefer this one.
 
 The smoke tests build a real-shape library inside `tmp_path`, seed a
 healthy and a broken asset, and exercise each subcommand via `main()`.
@@ -69,20 +73,14 @@ healthy and a broken asset, and exercise each subcommand via `main()`.
 
 ## Safety expectations for `fix-paths`
 
-`fix-paths --apply` mutates Serato's primary library database. New
-contributions to that path must preserve:
+`fix-paths --apply` mutates Serato's primary library database. The
+canonical list of invariants new contributions must preserve lives
+in [SECURITY.md](SECURITY.md#safety-expectations) — regressions in
+any of them are treated as security issues.
 
-1. Backup of `master.sqlite` via SQLite's Backup API before any writes.
-2. Backup integrity check (`PRAGMA integrity_check`) before the apply
-   touches the live database.
-3. Refusal to run while Serato DJ Pro is detected (`pgrep`) AND on
-   `BEGIN IMMEDIATE` lock contention.
-4. Single transaction; rollback on any error.
-5. WAL checkpoint after commit so a downstream copy reflects the fix.
-6. Audit log written via `.inprogress` tmp + atomic rename, so a
-   killed process never leaves a stale "applied" log on disk.
-7. Cleanup of dangling references in informal `asset_id` columns
-   (`container_asset`, `anonymous_table_*`) — not just formally-FK'd
-   tables. The `get_asset_referencing_columns()` enumeration is the
-   single source of truth for what needs cleanup; if you add a new
-   asset-id-bearing table, add it there.
+One contributor-only note: `get_asset_referencing_columns()` is the
+single source of truth for which tables need dangling-row cleanup
+(formally-FK'd or not). If you add a new asset-id-bearing table,
+add it there too — relying solely on `ON DELETE CASCADE` will miss
+informal columns like `container_asset.asset_id` and the
+`anonymous_table_*` sort caches in real Serato schemas.
