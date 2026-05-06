@@ -1,3 +1,3 @@
-"""Serato Crates Sync - Generate Serato DJ Pro crates from folder structure."""
+"""Serato Crates Sync — generate crates, audit library health, repair paths."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

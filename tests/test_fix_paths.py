@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from serato_crates_sync.cli import (
+from serato_crates_sync.fix_paths import (
     FixStats,
     apply_fixes,
     backup_serato_library,

@@ -11,8 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from serato_crates_sync.cli import (
-    DEFAULT_AUDIO_EXTENSIONS,
+from serato_crates_sync.library import DEFAULT_AUDIO_EXTENSIONS
+from serato_crates_sync.verify_paths import (
     PathVerificationReport,
     build_filesystem_index,
     classify_candidates,

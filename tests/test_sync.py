@@ -13,19 +13,21 @@ from pathlib import Path
 
 import pytest
 
-from serato_crates_sync.cli import (
+from serato_crates_sync.library import (
     DEFAULT_AUDIO_EXTENSIONS,
+    get_subcrates_folder,
+    parse_extensions,
+)
+from serato_crates_sync.sync import (
     CratePlan,
+    backup_subcrates,
     build_crate_tree,
     count_crates_and_tracks,
     create_sync_plan,
     get_existing_crate_names,
-    get_subcrates_folder,
     is_audio_file,
-    parse_extensions,
     scan_folder_for_tracks,
     write_crate_binary,
-    backup_subcrates,
 )
 
 
@@ -332,7 +334,7 @@ class TestIntegration:
 
     def test_apply_creates_crate_files(self, temp_music_folder, temp_serato_folder):
         """Verify apply creates crate files."""
-        from serato_crates_sync.cli import execute_sync
+        from serato_crates_sync.sync import execute_sync
 
         plan = create_sync_plan(
             music_root=temp_music_folder,
@@ -351,7 +353,7 @@ class TestIntegration:
 
     def test_apply_creates_backup(self, temp_music_folder, temp_serato_folder):
         """Verify apply creates backup."""
-        from serato_crates_sync.cli import execute_sync
+        from serato_crates_sync.sync import execute_sync
 
         plan = create_sync_plan(
             music_root=temp_music_folder,
