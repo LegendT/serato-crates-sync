@@ -168,3 +168,43 @@ def test_fix_paths_dry_run_smoke(monkeypatch, tmp_path):
         "--library-path", str(library),
     )
     assert rc == 0
+
+
+def test_fix_paths_apply_smoke(monkeypatch, tmp_path):
+    """End-to-end --apply: verify the orphan row gets deleted and the
+    audit log appears at its final path (not the .inprogress tmp)."""
+    music = _make_music_root(tmp_path / "music")
+    library = tmp_path / "master.sqlite"
+    _make_real_shape_library(library)
+    _seed_assets(library, music)
+
+    csv_out = tmp_path / "diag"
+    _run_cli(
+        monkeypatch,
+        "verify-paths",
+        "--library-path", str(library),
+        "--music-root", str(music),
+        "--csv-out", str(csv_out),
+    )
+
+    audit_log = tmp_path / "audit.csv"
+    rc = _run_cli(
+        monkeypatch,
+        "fix-paths",
+        "--from-csv", str(csv_out / "path-fixes.csv"),
+        "--library-path", str(library),
+        "--audit-log", str(audit_log),
+        "--apply",
+    )
+    assert rc == 0
+    # Orphan asset (id=2) should be gone
+    conn = sqlite3.connect(str(library))
+    remaining = conn.execute("SELECT id FROM asset ORDER BY id").fetchall()
+    conn.close()
+    assert remaining == [(1,)]
+    # Audit log appears at the final path; the .inprogress tmp does not
+    assert audit_log.exists()
+    assert not audit_log.with_name(audit_log.name + ".inprogress").exists()
+    # Backup file present alongside the library
+    backups = list(library.parent.glob(f"{library.name}.BACKUP.*"))
+    assert backups, "expected a master.sqlite.BACKUP.* file"

@@ -1351,7 +1351,10 @@ def backup_serato_library(library_path: Path) -> Path:
     """Create a clean snapshot of master.sqlite via SQLite's Backup API.
 
     Using the Backup API (rather than copying the file) yields a consistent
-    snapshot regardless of whether the WAL has been checkpointed.
+    snapshot regardless of whether the WAL has been checkpointed. The
+    snapshot is then opened and run through PRAGMA integrity_check so a
+    silent disk error doesn't hand us a corrupt backup we'd only notice
+    at rollback time.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
@@ -1365,6 +1368,17 @@ def backup_serato_library(library_path: Path) -> Path:
             dst.close()
     finally:
         src.close()
+
+    verify = sqlite3.connect(str(backup_path))
+    try:
+        result = verify.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        verify.close()
+    if not result or result[0] != "ok":
+        raise RuntimeError(
+            f"Backup integrity_check failed: {result!r}. "
+            f"Refusing to proceed with --apply."
+        )
 
     return backup_path
 
@@ -1675,14 +1689,57 @@ def run_fix_paths(
         )
         return 1
 
+    # Resolve where the audit log will eventually live, plus a tmp file
+    # we'll atomic-rename onto it after a successful commit so a kill or
+    # rollback never leaves a stale audit log claiming work that didn't
+    # actually persist.
+    audit_tmp_path: Optional[Path] = None
+    if audit_log_path is not None:
+        if apply:
+            audit_tmp_path = audit_log_path.with_name(
+                audit_log_path.name + ".inprogress"
+            )
+        else:
+            # Dry-run: nothing to roll back, write directly.
+            audit_tmp_path = audit_log_path
+
     if apply:
         backup = backup_serato_library(library_path)
         print(f"Backup: {backup}")
         # isolation_level=None lets us drive transactions explicitly so a single
-        # BEGIN ... COMMIT spans the whole run and rolls back atomically on error.
+        # BEGIN IMMEDIATE ... COMMIT spans the whole run and rolls back
+        # atomically on error.
         conn = sqlite3.connect(str(library_path), isolation_level=None)
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN")
+        # Verify FK enforcement actually engaged. SQLite silently no-ops
+        # unsupported pragmas; if we proceeded without it the cascade
+        # behaviour we rely on for selection_asset / dj_asset_metadata /
+        # space_asset / history_entry would not fire and we'd leak
+        # hundreds of thousands of dangling rows.
+        fk_state = conn.execute("PRAGMA foreign_keys").fetchone()
+        if not fk_state or fk_state[0] != 1:
+            conn.close()
+            logger.error(
+                "PRAGMA foreign_keys did not engage (got %r). "
+                "This SQLite build cannot enforce ON DELETE CASCADE; "
+                "refusing to proceed.",
+                fk_state,
+            )
+            return 1
+        # BEGIN IMMEDIATE acquires the write lock right away. If another
+        # process (Serato that pgrep missed, a stray shell, etc.) holds
+        # it, we get SQLITE_BUSY here rather than corrupting later.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            conn.close()
+            logger.error(
+                "Could not acquire write lock on master.sqlite (%s). "
+                "Another process — most likely Serato — is using it. "
+                "Quit Serato (Cmd+Q) and rerun.",
+                e,
+            )
+            return 1
     else:
         conn = connect_serato_library_readonly(library_path)
 
@@ -1694,14 +1751,28 @@ def run_fix_paths(
                 keep_orphans=keep_orphans,
                 ambiguous_too=ambiguous_too,
                 repair_only=repair_only,
-                audit_log_path=audit_log_path,
+                audit_log_path=audit_tmp_path,
             )
         except Exception:
             if apply:
                 conn.execute("ROLLBACK")
+                if audit_tmp_path is not None and audit_tmp_path.exists():
+                    audit_tmp_path.unlink()
             raise
         if apply:
             conn.execute("COMMIT")
+            # Persist WAL into the main file so a downstream copy of
+            # master.sqlite (without -wal/-shm) still reflects the fix.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Audit log atomically becomes visible at its final path only
+            # after commit succeeds.
+            if (
+                audit_tmp_path is not None
+                and audit_log_path is not None
+                and audit_tmp_path != audit_log_path
+                and audit_tmp_path.exists()
+            ):
+                audit_tmp_path.replace(audit_log_path)
     finally:
         conn.close()
 
