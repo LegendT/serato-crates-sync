@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
 """
-Serato Crates Sync CLI
+Serato Crates Sync CLI.
 
-Generate Serato DJ Pro compatible crates from folder structure.
+Subcommands:
+- sync           generate Serato crates from a folder hierarchy
+- diagnose       read-only health snapshot of master.sqlite
+- verify-paths   walk every asset row, check its path resolves on disk,
+                 and emit a CSV of repair candidates
+- fix-paths      apply repairs from a CSV inside a backed-up transaction
 
 Design Decisions:
 - Library: serato-crate (lightweight Python library for Serato crates)
 - Path storage: Serato stores absolute paths in crates
 - Subcrate naming: Uses %% delimiter convention for nested crate names
+- Library access: master.sqlite is opened read-only via URI for diagnose
+  and verify-paths so they coexist with a running Serato; fix-paths
+  refuses to run with --apply while Serato is detected.
 """
 
 import argparse
@@ -1757,26 +1765,37 @@ def main():
     """Main CLI entrypoint."""
     parser = argparse.ArgumentParser(
         prog="serato-crates",
-        description="Generate Serato DJ Pro crates from folder structure",
+        description=(
+            "Generate Serato DJ Pro crates from a folder structure, "
+            "audit master.sqlite health, and repair broken asset paths."
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Dry-run (no writes):
+  # Generate crates from your folder hierarchy (dry-run):
   serato-crates sync --music-root ~/Music/DJ
-
-  # Apply changes:
   serato-crates sync --music-root ~/Music/DJ --apply
 
-  # Custom Serato folder:
-  serato-crates sync --music-root ~/Music/DJ --serato-root ~/Music/_Serato_ --apply
+  # Read-only health snapshot of master.sqlite:
+  serato-crates diagnose
+  serato-crates diagnose --csv-out ~/serato-diag
 
-  # Allow overwriting existing crates:
-  serato-crates sync --music-root ~/Music/DJ --apply --overwrite
+  # Find every asset row whose path no longer resolves on disk and
+  # emit repair candidates to path-fixes.csv (no DB changes):
+  serato-crates verify-paths --music-root ~/Music/DJ --csv-out ~/serato-diag
+
+  # Apply the repairs (Serato DJ Pro must be quit first):
+  serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv             # dry-run
+  serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv --apply
 
 Safety:
-  - Default is DRY RUN (no writes) unless --apply is passed
-  - Backup is created automatically before any writes
-  - Existing crates are NOT overwritten unless --overwrite is passed
+  - sync       : default is DRY RUN; backs up Subcrates folder; does not
+                 overwrite existing .crate files unless --overwrite.
+  - diagnose   : read-only; safe with Serato running.
+  - verify-paths: read-only; safe with Serato running.
+  - fix-paths  : default is DRY RUN; with --apply, refuses to run if
+                 Serato is detected, snapshots master.sqlite via the
+                 SQLite Backup API, and runs in one transaction.
 """
     )
 
