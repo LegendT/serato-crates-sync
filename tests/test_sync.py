@@ -7,7 +7,6 @@ These tests verify:
 3. Crate file creation with backup
 """
 
-import os
 import tempfile
 from pathlib import Path
 
@@ -322,7 +321,7 @@ class TestIntegration:
         initial_files = set(subcrates.iterdir())
 
         # Create plan (this is what dry-run does)
-        plan = create_sync_plan(
+        create_sync_plan(
             music_root=temp_music_folder,
             serato_root=temp_serato_folder,
             extensions=DEFAULT_AUDIO_EXTENSIONS

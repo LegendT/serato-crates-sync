@@ -9,10 +9,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-import pytest
-
 from serato_crates_sync.cli import main
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,44 +31,11 @@ def _make_music_root(root: Path) -> Path:
 
 
 def _make_real_shape_library(path: Path) -> None:
-    """Build a master.sqlite with the columns the new subcommands query.
+    """Build a master.sqlite mirroring real Serato shape (see tests/_schemas.py)."""
+    from ._schemas import REAL_SHAPE_LIBRARY_SQL
 
-    Mirrors Serato's real schema in the dimensions that matter:
-    - asset has the columns gather_diagnostics / verify reads
-    - container_asset has asset_id with NO foreign key (the bug class
-      that bit us in production — must be exercised end-to-end)
-    """
     conn = sqlite3.connect(str(path))
-    conn.executescript(
-        """
-        CREATE TABLE asset (
-            id            INTEGER PRIMARY KEY AUTOINCREMENT,
-            location_id   INTEGER NOT NULL,
-            portable_id   TEXT NOT NULL,
-            file_name     TEXT,
-            file_size     INTEGER,
-            artist        TEXT NOT NULL DEFAULT '',
-            name          TEXT NOT NULL DEFAULT '',
-            album         TEXT NOT NULL DEFAULT '',
-            length_ms     INTEGER,
-            is_missing    INTEGER NOT NULL DEFAULT 0,
-            is_corrupt    INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(location_id, portable_id COLLATE NOCASE)
-        );
-        CREATE TABLE container (
-            id   INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL
-        );
-        -- container_asset: NO FK on asset_id (matches real Serato)
-        CREATE TABLE container_asset (
-            id           INTEGER PRIMARY KEY AUTOINCREMENT,
-            container_id INTEGER NOT NULL,
-            asset_id     INTEGER NOT NULL,
-            UNIQUE(container_id, asset_id),
-            FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE
-        );
-        """
-    )
+    conn.executescript(REAL_SHAPE_LIBRARY_SQL)
     conn.commit()
     conn.close()
 
@@ -186,6 +150,11 @@ def test_fix_paths_apply_smoke(monkeypatch, tmp_path):
         "--music-root", str(music),
         "--csv-out", str(csv_out),
     )
+
+    # Stub the running-Serato guard so this test is stable on developer
+    # machines that happen to have Serato open.
+    import serato_crates_sync.fix_paths as fix_paths_module
+    monkeypatch.setattr(fix_paths_module, "is_serato_running", lambda: False)
 
     audit_log = tmp_path / "audit.csv"
     rc = _run_cli(

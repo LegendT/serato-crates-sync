@@ -3,29 +3,18 @@
 Scans the given music root, builds a tree of CratePlan entries, and
 writes one ``.crate`` file per folder under the Serato Subcrates folder
 (via the ``serato-crate`` library, with a binary fallback). Backs up
-the existing Subcrates folder before writing.
-
-Also exports the manual-creation guide command and a SQLite-only crate
-write path used in the older Serato 4.0.x experiments.
+the existing Subcrates folder before writing. Also includes the
+manual-creation ``guide`` printer.
 """
 
 import shutil
-import sqlite3
 import struct
-import time
 import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
 
-from .library import (
-    get_default_serato_root,
-    get_serato_cache_folder,
-    get_subcrates_folder,
-    logger,
-)
-
+from .library import get_subcrates_folder, logger
 
 __all__ = [
     "CratePlan",
@@ -39,14 +28,9 @@ __all__ = [
     "print_plan",
     "backup_subcrates",
     "clean_existing_crates",
-    "clear_serato_database",
-    "clear_serato_library_database",
-    "clear_serato_cache",
     "sanitize_crate_filename",
     "write_crates_with_serato_crate",
     "write_crate_binary",
-    "clear_crates_from_sqlite",
-    "write_crates_to_sqlite",
     "execute_sync",
     "print_serato_guide",
 ]
@@ -57,7 +41,7 @@ class CratePlan:
     """Represents a planned crate with its tracks."""
     name: str
     path: Path  # Full path to the folder
-    parent_name: Optional[str]
+    parent_name: str | None
     tracks: list[Path] = field(default_factory=list)
     children: list["CratePlan"] = field(default_factory=list)
 
@@ -103,9 +87,9 @@ def scan_folder_for_tracks(
 def build_crate_tree(
     folder: Path,
     extensions: frozenset[str],
-    parent_name: Optional[str] = None,
+    parent_name: str | None = None,
     include_empty: bool = False,
-) -> Optional[CratePlan]:
+) -> CratePlan | None:
     """Recursively build a crate tree from a folder structure."""
     if not folder.is_dir():
         return None
@@ -248,7 +232,7 @@ def print_plan(plan: SyncPlan, verbose: bool = False) -> None:
     print()
 
 
-def backup_subcrates(serato_root: Path) -> Optional[Path]:
+def backup_subcrates(serato_root: Path) -> Path | None:
     """Create a timestamped backup of the Subcrates folder."""
     subcrates = get_subcrates_folder(serato_root)
     if not subcrates.exists():
@@ -281,113 +265,6 @@ def clean_existing_crates(serato_root: Path) -> int:
             logger.warning(f"Could not delete {crate_file}: {e}")
 
     return deleted_count
-
-
-def clear_serato_database(serato_root: Path) -> bool:
-    """Clear the Serato database V2 file to force crate rebuild."""
-    db_file = serato_root / "database V2"
-
-    if not db_file.exists():
-        logger.info("No database V2 file to clear")
-        return False
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_name = f"database_V2.BACKUP.{timestamp}"
-    backup_path = serato_root / backup_name
-
-    try:
-        shutil.copy2(db_file, backup_path)
-        logger.info(f"Backed up database to: {backup_path}")
-
-        db_file.unlink()
-        logger.info(f"Deleted database V2 (Serato will rebuild on next launch)")
-        return True
-    except Exception as e:
-        logger.warning(f"Could not clear database V2: {e}")
-        return False
-
-
-def clear_serato_library_database() -> bool:
-    """Clear Serato's SQLite library databases to force complete rebuild."""
-    cache_folder = get_serato_cache_folder()
-    library_folder = cache_folder / "Library"
-
-    if not library_folder.exists():
-        logger.info("No Serato Library folder found")
-        return False
-
-    sqlite_files = ["master.sqlite", "master.sqlite-shm", "master.sqlite-wal",
-                    "root.sqlite", "root.sqlite-shm", "root.sqlite-wal"]
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_folder = library_folder / f"backup_{timestamp}"
-
-    cleared_count = 0
-    for filename in sqlite_files:
-        filepath = library_folder / filename
-        if filepath.exists():
-            try:
-                backup_folder.mkdir(parents=True, exist_ok=True)
-                shutil.move(str(filepath), str(backup_folder / filename))
-                logger.info(f"Backed up and removed: {filename}")
-                cleared_count += 1
-            except Exception as e:
-                logger.warning(f"Could not clear {filename}: {e}")
-
-    if cleared_count > 0:
-        logger.info(f"Cleared {cleared_count} SQLite database files (backed up to {backup_folder})")
-        return True
-    else:
-        logger.info("No SQLite databases to clear")
-        return False
-
-
-def clear_serato_cache() -> bool:
-    """Clear Serato application cache to force refresh of crate data."""
-    cache_folder = get_serato_cache_folder()
-
-    if not cache_folder.exists():
-        logger.info(f"Serato cache folder not found: {cache_folder}")
-        return False
-
-    safe_to_clear = [
-        "Serato DJ Pro/History",
-        "Serato DJ Pro/HistoryExport",
-        "Serato DJ Pro/Recording",
-        "Serato DJ Pro/Temp",
-    ]
-
-    cleared_count = 0
-    for item_path in safe_to_clear:
-        full_path = cache_folder / item_path
-        if full_path.exists():
-            try:
-                if full_path.is_dir():
-                    shutil.rmtree(full_path)
-                else:
-                    full_path.unlink()
-                logger.info(f"Cleared cache: {full_path}")
-                cleared_count += 1
-            except Exception as e:
-                logger.warning(f"Could not clear {full_path}: {e}")
-
-    try:
-        for plist in cache_folder.glob("*.plist"):
-            try:
-                plist.unlink()
-                logger.info(f"Cleared cache: {plist}")
-                cleared_count += 1
-            except Exception as e:
-                logger.warning(f"Could not clear {plist}: {e}")
-    except Exception as e:
-        logger.warning(f"Could not scan for .plist files: {e}")
-
-    if cleared_count > 0:
-        logger.info(f"Cleared {cleared_count} cache items")
-        return True
-    else:
-        logger.info("No cache items to clear")
-        return False
 
 
 def sanitize_crate_filename(filename: str, max_bytes: int = 240) -> str:
@@ -517,118 +394,6 @@ def write_crates_with_serato_crate(
     return crates_created, crates_skipped
 
 
-def clear_crates_from_sqlite() -> int:
-    """Clear user-created crates from Serato's SQLite root.sqlite."""
-    cache_folder = get_serato_cache_folder()
-    db_path = cache_folder / "Library" / "root.sqlite"
-
-    if not db_path.exists():
-        logger.warning(f"Serato database not found: {db_path}")
-        return 0
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-        cursor.execute(
-            "DELETE FROM container WHERE type = 1 AND parent_id = 0"
-        )
-        deleted = cursor.rowcount
-        cursor.execute("UPDATE serato SET revision = revision + 1")
-        conn.commit()
-        conn.close()
-        logger.info(f"Deleted {deleted} crates from SQLite")
-        return deleted
-    except Exception as e:
-        logger.error(f"Failed to clear crates from SQLite: {e}")
-        return 0
-
-
-def write_crates_to_sqlite(
-    plan: SyncPlan,
-    subcrate_delimiter: str = "%%",
-) -> tuple[int, int]:
-    """Write crates directly to Serato's SQLite root.sqlite."""
-    cache_folder = get_serato_cache_folder()
-    db_path = cache_folder / "Library" / "root.sqlite"
-
-    if not db_path.exists():
-        logger.error(f"Serato database not found: {db_path}")
-        return 0, 0
-
-    crates_created = 0
-    crates_skipped = 0
-
-    try:
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
-
-        cursor.execute("SELECT revision FROM serato LIMIT 1")
-        row = cursor.fetchone()
-        revision = row[0] if row else 1
-
-        cursor.execute(
-            "SELECT COALESCE(MAX(list_order), 0) + 1 FROM container WHERE parent_id = 0"
-        )
-        next_order = cursor.fetchone()[0]
-
-        def create_crate_recursive(
-            crate_plan: CratePlan,
-            parent_id: int,
-            parent_prefix: str = "",
-            list_order: int = 1,
-        ) -> int:
-            nonlocal crates_created, crates_skipped, revision
-
-            if parent_prefix:
-                display_name = f"{parent_prefix}{subcrate_delimiter}{crate_plan.name}"
-            else:
-                display_name = crate_plan.name
-
-            cursor.execute(
-                "SELECT id FROM container WHERE parent_id = ? AND name = ? AND type = 1",
-                (parent_id, crate_plan.name),
-            )
-            existing = cursor.fetchone()
-
-            if existing:
-                crate_id = existing[0]
-                logger.info(f"Crate already exists: {display_name}")
-                crates_skipped += 1
-            else:
-                revision += 1
-                cursor.execute(
-                    """INSERT INTO container
-                       (revision, parent_id, name, type, list_order, time_added, expanded, portable_id)
-                       VALUES (?, ?, ?, 1, ?, ?, 0, ?)""",
-                    (revision, parent_id, crate_plan.name, list_order,
-                     int(time.time()), f"crate://{display_name}"),
-                )
-                crate_id = cursor.lastrowid
-                logger.info(f"Created crate: {display_name}")
-                crates_created += 1
-
-            child_order = 1
-            for child in crate_plan.children:
-                create_crate_recursive(child, crate_id, display_name, child_order)
-                child_order += 1
-
-            return crate_id
-
-        for crate_plan in plan.crates:
-            create_crate_recursive(crate_plan, 0, "", next_order)
-            next_order += 1
-
-        cursor.execute("UPDATE serato SET revision = ?", (revision,))
-        conn.commit()
-        conn.close()
-        logger.info(f"SQLite: Created {crates_created} crates, skipped {crates_skipped}")
-    except Exception as e:
-        logger.error(f"Failed to write to SQLite database: {e}")
-        return 0, 0
-
-    return crates_created, crates_skipped
-
-
 def execute_sync(
     plan: SyncPlan,
     overwrite: bool = False,
@@ -657,12 +422,12 @@ def execute_sync(
         path_mode=path_mode,
     )
 
-    print(f"\nSync complete!")
+    print("\nSync complete!")
     print(f"  Crates created: {created}")
     print(f"  Crates skipped: {skipped}")
 
     if backup_path:
-        print(f"\nTo restore from backup:")
+        print("\nTo restore from backup:")
         print(f"  rm -rf \"{subcrates}\"")
         print(f"  mv \"{backup_path}\" \"{subcrates}\"")
 

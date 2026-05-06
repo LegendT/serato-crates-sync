@@ -5,15 +5,10 @@ and the auto/ambiguous/orphan classification.
 """
 
 import csv
-import os
 import sqlite3
-from pathlib import Path
-
-import pytest
 
 from serato_crates_sync.library import DEFAULT_AUDIO_EXTENSIONS
 from serato_crates_sync.verify_paths import (
-    PathVerificationReport,
     build_filesystem_index,
     classify_candidates,
     find_candidates,
@@ -22,7 +17,6 @@ from serato_crates_sync.verify_paths import (
     score_candidate,
     verify_assets_against_filesystem,
 )
-
 
 ASSET_SCHEMA = """
 CREATE TABLE asset (
@@ -102,8 +96,8 @@ def test_classify_candidates():
 def test_find_candidates_ranks_by_ancestry(tmp_path):
     fs_index = {
         "song.mp3": [
-            "/music/World/song.mp3",
-            "/music/Acid Jazz/song.mp3",
+            ("/music/World/song.mp3", -1),
+            ("/music/Acid Jazz/song.mp3", -1),
         ],
     }
     broken = "/music/Acid Jazz/song.mp3"
@@ -117,7 +111,7 @@ def test_find_candidates_filters_by_file_size_when_helpful(tmp_path):
     b = tmp_path / "b.mp3"
     b.write_bytes(b"BBBBBBBB")  # 8 bytes
 
-    fs_index = {"song.mp3": [str(a), str(b)]}
+    fs_index = {"song.mp3": [(str(a), 4), (str(b), 8)]}
 
     # Asking for size 8 -> only b should remain
     ranked = find_candidates(

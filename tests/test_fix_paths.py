@@ -9,45 +9,13 @@ import csv
 import sqlite3
 from pathlib import Path
 
-import pytest
-
 from serato_crates_sync.fix_paths import (
-    FixStats,
     apply_fixes,
     backup_serato_library,
     get_asset_referencing_columns,
 )
 
-
-# An *idealised* schema where every reference to asset.id has a formal
-# FOREIGN KEY with ON DELETE CASCADE. Real Serato schemas don't —
-# container_asset and the anonymous_table_* sort caches reference
-# asset.id by column name only. The INFORMAL_SCHEMA below tests the
-# real shape; this one tests the cascade path in isolation.
-IDEALISED_SCHEMA = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE asset (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    location_id INTEGER NOT NULL,
-    portable_id TEXT NOT NULL,
-    UNIQUE(location_id, portable_id)
-);
-
-CREATE TABLE container (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL
-);
-
-CREATE TABLE container_asset (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    container_id INTEGER NOT NULL,
-    asset_id     INTEGER NOT NULL,
-    UNIQUE(container_id, asset_id),
-    FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE,
-    FOREIGN KEY(asset_id)     REFERENCES asset(id)     ON DELETE CASCADE
-);
-"""
+from ._schemas import IDEALISED_SCHEMA, INFORMAL_SCHEMA
 
 
 def _connect_with_schema():
@@ -360,39 +328,8 @@ def test_audit_log_records_actions(tmp_path):
 # Informal-FK scenario — mirrors the real Serato schema where some tables have
 # an `asset_id` column with no foreign key. Without explicit cleanup, deleting
 # from `asset` leaves dangling rows that crash Serato's library scan.
+# Schema lives in tests/_schemas.py and is reused by smoke tests.
 # ---------------------------------------------------------------------------
-
-INFORMAL_SCHEMA = """
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE asset (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    location_id INTEGER NOT NULL,
-    portable_id TEXT NOT NULL,
-    UNIQUE(location_id, portable_id)
-);
-
-CREATE TABLE container (
-    id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL
-);
-
--- container_asset: NO FK on asset_id (mirrors real Serato schema)
-CREATE TABLE container_asset (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    container_id INTEGER NOT NULL,
-    asset_id     INTEGER NOT NULL,
-    UNIQUE(container_id, asset_id),
-    FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE
-);
-
--- selection_asset: HAS FK with CASCADE (mirrors real Serato)
-CREATE TABLE selection_asset (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    asset_id INTEGER NOT NULL,
-    FOREIGN KEY(asset_id) REFERENCES asset(id) ON DELETE CASCADE
-);
-"""
 
 
 def _connect_informal_schema():

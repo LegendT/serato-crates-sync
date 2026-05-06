@@ -7,13 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `SECURITY.md` with vulnerability disclosure path and the safety
+  invariants `fix-paths --apply` is committed to upholding.
+- Audit log now includes an `applied_at` UTC timestamp column. Existing
+  audit logs from v0.2.0 are still readable; the new column is appended.
+- `fix-paths --apply` prints a "Preflight" summary line per safety
+  check (backup created, foreign-key enforcement engaged, write lock
+  acquired) before processing starts.
+- `fix-paths --apply` prints a rollback note explaining that
+  `master.sqlite-wal` and `master.sqlite-shm` must also be removed
+  when restoring the backup file.
+- `verify-paths` reports per-phase elapsed time (filesystem walk,
+  asset iteration).
+- `diagnose` "By location" table now joins against the `location` row
+  to show the path alongside the bare `location_id`.
+- `verify-paths --csv-out` accepts either a directory (writes
+  `path-fixes.csv` inside) or a `.csv` file path (writes straight to it).
+- New `tests/test_public_api.py` guards each module's `__all__`.
+- `tests/_schemas.py` consolidates the schema fixtures shared by the
+  fix-paths and smoke tests.
+- CI: `ruff check` lint job (separate from the pytest matrix); pytest
+  now also reports coverage.
+
 ### Changed
 
-- `cli.py` split into per-feature modules (`sync`, `diagnose`,
-  `verify_paths`, `fix_paths`, plus shared `library`). The CLI module
-  now contains only argparse setup and dispatch. Imports from
-  `serato_crates_sync.cli` for feature functions are no longer
-  supported — import from the relevant feature module instead.
+- `is_serato_running` matches Serato DJ Pro / DJ Lite / DJ / Studio
+  (was DJ Pro only). Other Serato variants would previously slip past
+  the `--apply` guard.
+- `build_filesystem_index` captures file sizes during the walk via
+  `os.scandir` so `find_candidates` no longer stat-storms when many
+  candidates share a filename.
+- `fix-paths` backup connections set a 10-second timeout, so a Serato
+  that slipped past `pgrep` produces a clear error instead of hanging
+  on the lock.
+- Dependency pins are bounded: `serato-crate>=0.0.1,<1.0`,
+  `typing_extensions>=4.0.0,<5`.
+- Test fixtures consolidated: `IDEALISED_SCHEMA`, `INFORMAL_SCHEMA`,
+  and `REAL_SHAPE_LIBRARY_SQL` now live in `tests/_schemas.py`.
+
+### Fixed
+
+- CHANGELOG: the cli-refactor breaking note now sits under `[0.2.0]`
+  where it belongs, not in `[Unreleased]`.
+- The fix-paths `--apply` smoke test no longer fails on developer
+  machines that have Serato running — `is_serato_running` is
+  monkeypatched in that test.
+
+### Removed
+
+- Dead/legacy code from `sync.py`: `clear_serato_database`,
+  `clear_serato_library_database`, `clear_serato_cache`,
+  `write_crates_to_sqlite`, `clear_crates_from_sqlite`. None were
+  reachable via the CLI; they were leftovers from Serato 4.0.x
+  experiments superseded by `fix-paths`. Removed from each module's
+  `__all__` and from importable surface.
 
 ## [0.2.0] — 2026-05-06
 
@@ -43,6 +92,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `LICENSE` (MIT) and `CONTRIBUTING.md`.
 - README sections covering library health concepts and the new
   subcommands.
+
+### Changed
+
+- **Breaking (internal):** `cli.py` split into per-feature modules
+  (`sync`, `diagnose`, `verify_paths`, `fix_paths`, plus shared
+  `library`). The CLI module now contains only argparse setup and
+  dispatch. Imports from `serato_crates_sync.cli` for feature
+  functions are no longer supported — import from the relevant feature
+  module instead. The CLI surface (subcommands and flags) is unchanged.
 
 ### Fixed
 

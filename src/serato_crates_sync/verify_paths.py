@@ -12,10 +12,8 @@ import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from .library import connect_serato_library_readonly, logger
-
 
 __all__ = [
     "PathVerificationReport",
@@ -62,20 +60,48 @@ def fs_path_to_portable_id(fs_path: str, leading_slash: bool) -> str:
 def build_filesystem_index(
     music_root: Path,
     extensions: frozenset[str],
-) -> dict[str, list[str]]:
-    """Walk music_root once, returning filename.lower() -> list of absolute paths."""
-    index: dict[str, list[str]] = {}
-    for dirpath, dirnames, filenames in os.walk(str(music_root)):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
-        for fname in filenames:
-            if fname.startswith("."):
+) -> dict[str, list[tuple[str, int]]]:
+    """Walk music_root once, returning filename.lower() -> [(path, file_size_bytes), ...].
+
+    File sizes are captured during the walk via ``os.scandir`` (which already
+    has the stat available, so no extra syscall). This lets ``find_candidates``
+    compare against the asset row's ``file_size`` with a dict lookup instead
+    of stat-ing every candidate at lookup time — a measurable saving on
+    libraries with many same-named files (``Track01.mp3`` etc.).
+
+    A size of ``-1`` means the stat failed for that entry.
+    """
+    index: dict[str, list[tuple[str, int]]] = {}
+
+    def _walk(directory: str) -> None:
+        try:
+            with os.scandir(directory) as it:
+                entries = list(it)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name.startswith("."):
                 continue
-            ext = os.path.splitext(fname)[1].lower()
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    _walk(entry.path)
+                    continue
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            ext = os.path.splitext(entry.name)[1].lower()
             if ext not in extensions:
                 continue
-            index.setdefault(fname.lower(), []).append(
-                os.path.join(dirpath, fname)
+            try:
+                size = entry.stat(follow_symlinks=False).st_size
+            except OSError:
+                size = -1
+            index.setdefault(entry.name.lower(), []).append(
+                (entry.path, size)
             )
+
+    _walk(str(music_root))
     return index
 
 
@@ -89,7 +115,7 @@ def score_candidate(broken_path: str, candidate: str) -> int:
     broken_parents = os.path.dirname(broken_path).split(os.sep)
     cand_parents = os.path.dirname(candidate).split(os.sep)
     score = 0
-    for b, c in zip(reversed(broken_parents), reversed(cand_parents)):
+    for b, c in zip(reversed(broken_parents), reversed(cand_parents), strict=False):
         if b == c:
             score += 1
         else:
@@ -99,31 +125,27 @@ def score_candidate(broken_path: str, candidate: str) -> int:
 
 def find_candidates(
     broken_path: str,
-    file_size_db: Optional[int],
-    fs_index: dict[str, list[str]],
+    file_size_db: int | None,
+    fs_index: dict[str, list[tuple[str, int]]],
 ) -> list[str]:
     """Return candidates ordered by ancestry-similarity (best first).
 
     Filters by on-disk file_size only when (a) we have a recorded size
-    and (b) there is more than one candidate sharing the filename. This
-    avoids stat-ing every candidate when filename alone is decisive.
+    and (b) there is more than one candidate sharing the filename. Sizes
+    were captured during the fs-walk so this is a dict comparison, not
+    a stat-storm at lookup time.
     """
     fname = os.path.basename(broken_path).lower()
-    candidates = list(fs_index.get(fname, []))
-    if not candidates:
+    entries = list(fs_index.get(fname, []))
+    if not entries:
         return []
-    if len(candidates) > 1 and file_size_db:
-        size_matches = []
-        for c in candidates:
-            try:
-                if os.stat(c).st_size == file_size_db:
-                    size_matches.append(c)
-            except OSError:
-                pass
+    if len(entries) > 1 and file_size_db:
+        size_matches = [(p, s) for (p, s) in entries if s == file_size_db]
         if size_matches:
-            candidates = size_matches
-    candidates.sort(key=lambda p: score_candidate(broken_path, p), reverse=True)
-    return candidates
+            entries = size_matches
+    paths = [p for (p, _) in entries]
+    paths.sort(key=lambda p: score_candidate(broken_path, p), reverse=True)
+    return paths
 
 
 def classify_candidates(
@@ -140,7 +162,7 @@ def classify_candidates(
     return "auto" if top_score > runner_score else "ambiguous"
 
 
-def _broken_prefix_key(fs_path: str, music_root: Optional[str], depth: int = 2) -> str:
+def _broken_prefix_key(fs_path: str, music_root: str | None, depth: int = 2) -> str:
     """Bucket key for grouping broken paths in the verify-paths summary.
 
     If music_root is supplied, returns the first ``depth`` path components
@@ -156,9 +178,9 @@ def _broken_prefix_key(fs_path: str, music_root: Optional[str], depth: int = 2) 
 
 def verify_assets_against_filesystem(
     conn: sqlite3.Connection,
-    fs_index: dict[str, list[str]],
-    csv_path: Optional[Path],
-    music_root: Optional[str] = None,
+    fs_index: dict[str, list[tuple[str, int]]],
+    csv_path: Path | None,
+    music_root: str | None = None,
     progress_every: int = 50000,
 ) -> PathVerificationReport:
     """Stream every asset row, check path existence, classify broken rows."""
@@ -272,7 +294,7 @@ def run_verify_paths(
     library_path: Path,
     music_root: Path,
     extensions: frozenset[str],
-    csv_out_dir: Optional[Path],
+    csv_out_dir: Path | None,
 ) -> int:
     """Read-only check that every asset path resolves; emit repair candidates."""
     if not library_path.exists():
@@ -282,17 +304,31 @@ def run_verify_paths(
         logger.error(f"Music root not found or not a directory: {music_root}")
         return 1
 
-    print(f"Indexing files under: {music_root}")
-    fs_index = build_filesystem_index(music_root, extensions)
-    total_files = sum(len(paths) for paths in fs_index.values())
-    print(f"  {total_files:,} files across {len(fs_index):,} unique filenames\n")
+    import time as _time
 
-    csv_path: Optional[Path] = None
+    print(f"Indexing files under: {music_root}")
+    walk_start = _time.monotonic()
+    fs_index = build_filesystem_index(music_root, extensions)
+    walk_elapsed = _time.monotonic() - walk_start
+    total_files = sum(len(paths) for paths in fs_index.values())
+    print(
+        f"  {total_files:,} files across {len(fs_index):,} unique filenames "
+        f"({walk_elapsed:.1f}s)\n"
+    )
+
+    csv_path: Path | None = None
     if csv_out_dir is not None:
-        csv_out_dir.mkdir(parents=True, exist_ok=True)
-        csv_path = csv_out_dir / "path-fixes.csv"
+        # Accept either a directory (write path-fixes.csv inside) or a
+        # path ending in .csv (write straight to that file).
+        if csv_out_dir.suffix.lower() == ".csv":
+            csv_path = csv_out_dir
+            csv_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            csv_out_dir.mkdir(parents=True, exist_ok=True)
+            csv_path = csv_out_dir / "path-fixes.csv"
 
     print(f"Verifying assets in: {library_path}")
+    verify_start = _time.monotonic()
     conn = connect_serato_library_readonly(library_path)
     try:
         report = verify_assets_against_filesystem(
@@ -300,6 +336,8 @@ def run_verify_paths(
         )
     finally:
         conn.close()
+    verify_elapsed = _time.monotonic() - verify_start
+    print(f"  asset iteration: {verify_elapsed:.1f}s")
 
     print_path_verification_report(report)
     if csv_path is not None:

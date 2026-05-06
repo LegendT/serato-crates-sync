@@ -6,18 +6,14 @@ known fixtures, and verify gather_diagnostics + the CSV exporters.
 
 import csv
 import sqlite3
-import tempfile
-from pathlib import Path
 
 import pytest
 
 from serato_crates_sync.diagnose import (
-    DiagnosticReport,
     export_duplicate_tracks_csv,
     export_missing_assets_csv,
     gather_diagnostics,
 )
-
 
 # Minimal subset of the real Serato schema — only the columns the diagnose
 # code actually queries. Real schema has many more columns and triggers.
@@ -110,8 +106,9 @@ def test_gather_diagnostics_counts(synthetic_library):
     assert {loc[0] for loc in report.by_location} == {1, 5}
     # Location 1 has 7 rows, 1 missing, 1 corrupt
     by_loc = {loc[0]: loc for loc in report.by_location}
-    assert by_loc[1] == (1, 7, 1, 1)
-    assert by_loc[5] == (5, 1, 0, 0)
+    # The synthetic schema has no `location` table, so the path slot is "".
+    assert by_loc[1] == (1, 7, 1, 1, "")
+    assert by_loc[5] == (5, 1, 0, 0, "")
 
 
 def test_gather_diagnostics_duplicate_metric_uses_strong_key(synthetic_library):
