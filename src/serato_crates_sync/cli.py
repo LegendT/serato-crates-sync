@@ -11,6 +11,7 @@ Design Decisions:
 """
 
 import argparse
+import csv
 import logging
 import os
 import shutil
@@ -874,6 +875,212 @@ def execute_sync(
     return True
 
 
+@dataclass
+class DiagnosticReport:
+    """Read-only summary of Serato library health."""
+    library_path: Path
+    total_assets: int
+    missing_assets: int
+    corrupt_assets: int
+    distinct_file_names: int
+    distinct_paths: int
+    by_location: list[tuple[int, int, int, int]]  # (location_id, total, missing, corrupt)
+    duplicate_metadata_groups: int
+    duplicate_metadata_excess_rows: int
+
+
+def get_default_serato_library_path() -> Path:
+    """Get the default Serato master.sqlite path for the current platform."""
+    if sys.platform == "darwin":
+        return (
+            Path.home()
+            / "Library" / "Application Support" / "Serato" / "Library" / "master.sqlite"
+        )
+    elif sys.platform == "win32":
+        return (
+            Path(os.environ.get("LOCALAPPDATA", ""))
+            / "Serato" / "Library" / "master.sqlite"
+        )
+    else:
+        return Path.home() / ".serato" / "Library" / "master.sqlite"
+
+
+def connect_serato_library_readonly(library_path: Path) -> sqlite3.Connection:
+    """Open Serato's master.sqlite in read-only mode.
+
+    Safe to use while Serato DJ Pro is running: WAL mode plus a busy
+    timeout means we coexist with the live writer rather than blocking it.
+    """
+    uri = f"file:{library_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=10.0)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def gather_diagnostics(conn: sqlite3.Connection) -> DiagnosticReport:
+    """Run read-only counts against an open Serato library connection."""
+    cur = conn.cursor()
+
+    cur.execute("SELECT COUNT(*) FROM asset")
+    total = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM asset WHERE is_missing = 1")
+    missing = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(*) FROM asset WHERE is_corrupt = 1")
+    corrupt = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT COUNT(DISTINCT file_name) FROM asset "
+        "WHERE file_name IS NOT NULL AND file_name != ''"
+    )
+    distinct_filenames = cur.fetchone()[0]
+
+    cur.execute("SELECT COUNT(DISTINCT portable_id) FROM asset")
+    distinct_paths = cur.fetchone()[0]
+
+    cur.execute(
+        "SELECT location_id, COUNT(*), COALESCE(SUM(is_missing), 0), "
+        "       COALESCE(SUM(is_corrupt), 0) "
+        "FROM asset GROUP BY location_id ORDER BY location_id"
+    )
+    by_location = [tuple(row) for row in cur.fetchall()]
+
+    # Strong duplicate key: same artist + name + length within a location.
+    # Filename-only would lump every "Track01.mp3" together — useless noise.
+    cur.execute(
+        "SELECT COUNT(*), COALESCE(SUM(n - 1), 0) FROM ("
+        "  SELECT COUNT(*) AS n FROM asset "
+        "  WHERE artist != '' AND name != '' AND length_ms IS NOT NULL "
+        "  GROUP BY location_id, artist, name, length_ms HAVING COUNT(*) > 1"
+        ")"
+    )
+    dup_groups, dup_excess = cur.fetchone()
+
+    # library_path is filled in by the caller (it owns the connection)
+    return DiagnosticReport(
+        library_path=Path(""),
+        total_assets=total,
+        missing_assets=missing,
+        corrupt_assets=corrupt,
+        distinct_file_names=distinct_filenames,
+        distinct_paths=distinct_paths,
+        by_location=by_location,
+        duplicate_metadata_groups=dup_groups,
+        duplicate_metadata_excess_rows=dup_excess,
+    )
+
+
+def export_missing_assets_csv(conn: sqlite3.Connection, out_path: Path) -> int:
+    """Write a CSV row for every asset flagged is_missing. Returns row count."""
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT id, location_id, file_name, portable_id, artist, name, album, "
+        "       is_corrupt "
+        "FROM asset WHERE is_missing = 1 "
+        "ORDER BY location_id, portable_id"
+    )
+    written = 0
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "id", "location_id", "file_name", "portable_id",
+            "artist", "name", "album", "is_corrupt",
+        ])
+        for row in cur:
+            writer.writerow(list(row))
+            written += 1
+    return written
+
+
+def export_duplicate_tracks_csv(conn: sqlite3.Connection, out_path: Path) -> int:
+    """Write a CSV row for every (artist, name, length) duplicate group.
+
+    A "duplicate" here is asset rows sharing the same artist, name, and
+    length_ms within a location — i.e. the same song listed multiple times,
+    typically with different file paths or filenames. Filename-only matching
+    was rejected because generic names ("Track01.mp3") collapse unrelated
+    albums into spurious duplicate groups.
+
+    Each row includes the duplicate count, pipe-delimited paths, and how
+    many of the duplicates Serato has flagged as missing.
+    """
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT location_id, artist, name, length_ms, COUNT(*) AS dup_count, "
+        "       GROUP_CONCAT(portable_id, '|') AS paths, "
+        "       COALESCE(SUM(is_missing), 0) AS n_missing "
+        "FROM asset "
+        "WHERE artist != '' AND name != '' AND length_ms IS NOT NULL "
+        "GROUP BY location_id, artist, name, length_ms "
+        "HAVING COUNT(*) > 1 "
+        "ORDER BY dup_count DESC, artist, name"
+    )
+    written = 0
+    with out_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "location_id", "artist", "name", "length_ms",
+            "dup_count", "paths", "n_missing",
+        ])
+        for row in cur:
+            writer.writerow(list(row))
+            written += 1
+    return written
+
+
+def print_diagnostic_report(report: DiagnosticReport) -> None:
+    """Print a human-readable diagnostic summary to stdout."""
+    print(f"\n{'='*60}")
+    print("SERATO LIBRARY DIAGNOSTIC")
+    print(f"{'='*60}")
+    print(f"Library:           {report.library_path}")
+    print(f"{'-'*60}")
+    print(f"Total asset rows:  {report.total_assets:>10,}")
+    print(f"Distinct paths:    {report.distinct_paths:>10,}")
+    print(f"Distinct filenames:{report.distinct_file_names:>10,}")
+    print(f"Missing (warning): {report.missing_assets:>10,}")
+    print(f"Corrupt:           {report.corrupt_assets:>10,}")
+    print(f"{'-'*60}")
+    print("By location:")
+    print(f"  {'location_id':>11}  {'total':>10}  {'missing':>10}  {'corrupt':>10}")
+    for loc_id, total, n_missing, n_corrupt in report.by_location:
+        print(f"  {loc_id:>11}  {total:>10,}  {n_missing:>10,}  {n_corrupt:>10,}")
+    print(f"{'-'*60}")
+    print("Duplicate tracks (same artist + name + length):")
+    print(f"  Duplicate groups:        {report.duplicate_metadata_groups:>10,}")
+    print(f"  Excess rows over unique: {report.duplicate_metadata_excess_rows:>10,}")
+    print(f"{'='*60}\n")
+
+
+def run_diagnose(library_path: Path, csv_out_dir: Optional[Path]) -> int:
+    """Open the Serato library read-only and report diagnostics."""
+    if not library_path.exists():
+        logger.error(f"Serato library not found: {library_path}")
+        return 1
+
+    conn = connect_serato_library_readonly(library_path)
+    try:
+        report = gather_diagnostics(conn)
+        report.library_path = library_path
+        print_diagnostic_report(report)
+
+        if csv_out_dir is not None:
+            csv_out_dir.mkdir(parents=True, exist_ok=True)
+            missing_path = csv_out_dir / "missing-assets.csv"
+            dupes_path = csv_out_dir / "duplicate-tracks.csv"
+            n_missing = export_missing_assets_csv(conn, missing_path)
+            n_dupes = export_duplicate_tracks_csv(conn, dupes_path)
+            print(f"Wrote {n_missing:,} missing-asset rows to: {missing_path}")
+            print(f"Wrote {n_dupes:,} duplicate-track groups to: {dupes_path}")
+            print()
+    finally:
+        conn.close()
+
+    return 0
+
+
 def validate_music_root(raw_path: Path) -> Optional[Path]:
     """Resolve and validate a music root path. Returns resolved Path or None."""
     resolved = raw_path.expanduser().resolve()
@@ -988,6 +1195,24 @@ Safety:
         help="Show detailed output including track names"
     )
 
+    # diagnose command - read-only health check of Serato library
+    diagnose_parser = subparsers.add_parser(
+        "diagnose",
+        help="Read-only diagnostic of the Serato library (missing tracks, duplicate paths)"
+    )
+    diagnose_parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})"
+    )
+    diagnose_parser.add_argument(
+        "--csv-out",
+        type=Path,
+        default=None,
+        help="Directory to write missing-assets.csv and duplicate-paths.csv (optional)"
+    )
+
     # guide command - generate manual crate creation instructions
     guide_parser = subparsers.add_parser(
         "guide",
@@ -1066,6 +1291,19 @@ Safety:
         )
 
         return 0 if success else 1
+
+    elif args.command == "diagnose":
+        library_path = args.library_path
+        if library_path is None:
+            library_path = get_default_serato_library_path()
+        else:
+            library_path = library_path.expanduser().resolve()
+
+        csv_out = args.csv_out
+        if csv_out is not None:
+            csv_out = csv_out.expanduser().resolve()
+
+        return run_diagnose(library_path, csv_out)
 
     elif args.command == "guide":
         music_root = validate_music_root(args.music_root)

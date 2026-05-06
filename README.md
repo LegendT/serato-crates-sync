@@ -147,6 +147,34 @@ serato-crates sync --music-root /Volumes/DJUSB/Music --apply --path-mode relativ
 serato-crates sync --music-root ~/Music --extensions mp3,wav --apply
 ```
 
+### Diagnose Library Health
+
+The `diagnose` subcommand performs a **read-only** health check of your
+Serato library, reporting missing tracks (the warning triangle in the
+Serato UI), corrupt assets, and duplicate-track groups (same artist +
+name + length appearing multiple times):
+
+```bash
+# Summary only
+serato-crates diagnose
+
+# Summary plus CSV export of every missing asset and every duplicate group
+serato-crates diagnose --csv-out ~/serato-diag
+
+# Override the library path (default: ~/Library/Application Support/Serato/Library/master.sqlite on macOS)
+serato-crates diagnose --library-path /path/to/master.sqlite
+```
+
+The command opens the database in read-only mode and is safe to run
+while Serato DJ Pro is active. Two CSVs are written when `--csv-out` is
+given:
+
+- `missing-assets.csv` — one row per asset flagged `is_missing` in Serato
+- `duplicate-tracks.csv` — one row per (artist, name, length) group with more than one asset, with all variant paths pipe-delimited
+
+`diagnose` does not modify the database. Use the output to plan any
+subsequent purge.
+
 ## Verification Checklist
 
 After running with `--apply`, verify in Serato DJ Pro 4.0.2:
