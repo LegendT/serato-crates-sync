@@ -1361,24 +1361,56 @@ def backup_serato_library(library_path: Path) -> Path:
     return backup_path
 
 
-def get_asset_referencing_tables(conn: sqlite3.Connection) -> list[tuple[str, str]]:
-    """Find every (table, column) with a FOREIGN KEY pointing at asset.id.
+def get_asset_referencing_columns(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str, bool]]:
+    """Find every column referencing asset.id (formal or informal).
 
-    Used by the merge path so we can re-parent dependent rows from the
-    broken asset id to the healthy one before deleting the broken row.
+    Returns triples ``(table, column, has_cascade_fk)``. The third flag is
+    True when the column has a FOREIGN KEY to asset.id with ON DELETE
+    CASCADE — fix-paths can rely on the engine to clean up after a
+    ``DELETE FROM asset``. False means the reference is informal (column
+    named asset_id but no FK) or the FK action is not CASCADE — in that
+    case fix-paths must DELETE leftover dependent rows itself.
+
+    Real Serato schemas have asset_id columns with NO foreign key on
+    several important tables (container_asset, anonymous_table_0/1/2,
+    static_selection_asset). Trusting only formal FKs leaves dangling
+    rows behind on asset DELETE and triggers Serato's "Operation failed"
+    error on next launch.
     """
-    refs: list[tuple[str, str]] = []
+    refs: list[tuple[str, str, bool]] = []
     cur = conn.cursor()
     cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
     tables = [r[0] for r in cur.fetchall()]
     for t in tables:
         if t == "asset" or not _SAFE_IDENT.match(t):
             continue
+
+        cascade_fk_cols: set[str] = set()
         for fk in cur.execute(f"PRAGMA foreign_key_list({t})").fetchall():
             # fk: (id, seq, table, from, to, on_update, on_delete, match)
-            if fk[2] == "asset" and fk[4] == "id" and _SAFE_IDENT.match(fk[3]):
-                refs.append((t, fk[3]))
+            if (
+                fk[2] == "asset"
+                and fk[4] == "id"
+                and fk[6] == "CASCADE"
+                and _SAFE_IDENT.match(fk[3])
+            ):
+                cascade_fk_cols.add(fk[3])
+                refs.append((t, fk[3], True))
+
+        for col in cur.execute(f"PRAGMA table_info({t})").fetchall():
+            cname = col[1]
+            if cname == "asset_id" and _SAFE_IDENT.match(cname) and cname not in cascade_fk_cols:
+                refs.append((t, cname, False))
     return refs
+
+
+# Backwards-compatible alias for tests that still import the old name.
+def get_asset_referencing_tables(
+    conn: sqlite3.Connection,
+) -> list[tuple[str, str]]:
+    return [(t, c) for (t, c, _) in get_asset_referencing_columns(conn)]
 
 
 def _load_asset_maps(
@@ -1407,7 +1439,7 @@ def _load_asset_maps(
 def _process_fix_row(
     conn: sqlite3.Connection,
     row: dict,
-    ref_tables: list[tuple[str, str]],
+    ref_columns: list[tuple[str, str, bool]],
     stats: FixStats,
     audit_writer,
     id_to_portable: dict[int, str],
@@ -1449,6 +1481,15 @@ def _process_fix_row(
             log("skipped_keep_orphans")
             return
         if apply:
+            # Manually remove rows in informal asset_id columns (no FK
+            # CASCADE). Cascade-FK tables clean themselves up on the asset
+            # DELETE below.
+            for table, column, has_cascade in ref_columns:
+                if not has_cascade:
+                    conn.execute(
+                        f"DELETE FROM {table} WHERE {column} = ?",
+                        (asset_id,),
+                    )
             conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
         # Update maps either way so dry-run stats stay consistent
         id_to_portable.pop(asset_id, None)
@@ -1498,14 +1539,24 @@ def _process_fix_row(
         return
 
     if apply:
-        for table, column in ref_tables:
-            # UPDATE OR IGNORE: if (other_id, healthy_id) already exists in
-            # the dependent table, the duplicate broken-side row is left
-            # alone — it'll be removed by the subsequent CASCADE delete.
+        for table, column, has_cascade in ref_columns:
+            # UPDATE OR IGNORE: re-parent the row to the healthy asset
+            # where possible. If the dependent table has a UNIQUE on
+            # (other_id, asset_id) and the healthy id is already present,
+            # the broken-side row is left alone here.
             conn.execute(
                 f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
                 (existing_id, asset_id),
             )
+            if not has_cascade:
+                # No CASCADE will sweep up the rows UPDATE OR IGNORE
+                # skipped — delete them explicitly so the asset DELETE
+                # doesn't leave dangling references that crash Serato's
+                # next library scan.
+                conn.execute(
+                    f"DELETE FROM {table} WHERE {column} = ?",
+                    (asset_id,),
+                )
         conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
     # Maintain maps
     id_to_portable.pop(asset_id, None)
@@ -1528,7 +1579,7 @@ def apply_fixes(
 ) -> FixStats:
     """Stream the path-fixes CSV and apply each row's repair (or dry-run)."""
     stats = FixStats()
-    ref_tables = get_asset_referencing_tables(conn)
+    ref_columns = get_asset_referencing_columns(conn)
 
     print("  loading asset table into memory...")
     id_to_portable, path_to_id = _load_asset_maps(conn)
@@ -1551,7 +1602,7 @@ def apply_fixes(
             for row in reader:
                 stats.total_csv_rows += 1
                 _process_fix_row(
-                    conn, row, ref_tables, stats, audit_writer,
+                    conn, row, ref_columns, stats, audit_writer,
                     id_to_portable, path_to_id,
                     apply=apply,
                     keep_orphans=keep_orphans,

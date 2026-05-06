@@ -15,6 +15,7 @@ from serato_crates_sync.cli import (
     FixStats,
     apply_fixes,
     backup_serato_library,
+    get_asset_referencing_columns,
     get_asset_referencing_tables,
 )
 
@@ -346,6 +347,133 @@ def test_audit_log_records_actions(tmp_path):
     rows = list(csv.DictReader(audit_path.open()))
     actions = {r["asset_id"]: r["action"] for r in rows}
     assert actions == {"1": "updated", "2": "orphan_deleted"}
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Informal-FK scenario — mirrors the real Serato schema where some tables have
+# an `asset_id` column with no foreign key. Without explicit cleanup, deleting
+# from `asset` leaves dangling rows that crash Serato's library scan.
+# ---------------------------------------------------------------------------
+
+INFORMAL_SCHEMA = """
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE asset (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    location_id INTEGER NOT NULL,
+    portable_id TEXT NOT NULL,
+    UNIQUE(location_id, portable_id)
+);
+
+CREATE TABLE container (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL
+);
+
+-- container_asset: NO FK on asset_id (mirrors real Serato schema)
+CREATE TABLE container_asset (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    container_id INTEGER NOT NULL,
+    asset_id     INTEGER NOT NULL,
+    UNIQUE(container_id, asset_id),
+    FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE
+);
+
+-- selection_asset: HAS FK with CASCADE (mirrors real Serato)
+CREATE TABLE selection_asset (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    asset_id INTEGER NOT NULL,
+    FOREIGN KEY(asset_id) REFERENCES asset(id) ON DELETE CASCADE
+);
+"""
+
+
+def _connect_informal_schema():
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(INFORMAL_SCHEMA)
+    return conn
+
+
+def test_referencing_columns_distinguishes_cascade_from_informal():
+    conn = _connect_informal_schema()
+    refs = get_asset_referencing_columns(conn)
+    by_table = {(t, c): cascade for (t, c, cascade) in refs}
+    assert by_table[("selection_asset", "asset_id")] is True
+    assert by_table[("container_asset", "asset_id")] is False
+    conn.close()
+
+
+def test_orphan_delete_cleans_up_informal_references(tmp_path):
+    conn = _connect_informal_schema()
+    _insert_asset(conn, 1, 1, "music/gone/song.mp3")
+    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
+    _insert_container_asset(conn, 10, 1)
+
+    csv_path = tmp_path / "fixes.csv"
+    _write_csv(csv_path, [{
+        "asset_id": "1", "location_id": "1",
+        "old_portable_id": "music/gone/song.mp3",
+        "proposed_new_portable_id": "",
+        "confidence": "orphan",
+    }])
+
+    apply_fixes(
+        conn, csv_path,
+        apply=True, keep_orphans=False, ambiguous_too=False,
+        repair_only=False, audit_log_path=None,
+    )
+
+    # No dangling container_asset row left behind
+    dangling = conn.execute(
+        "SELECT COUNT(*) FROM container_asset "
+        "WHERE asset_id NOT IN (SELECT id FROM asset)"
+    ).fetchone()[0]
+    assert dangling == 0
+    conn.close()
+
+
+def test_merge_cleans_up_informal_conflict_rows(tmp_path):
+    conn = _connect_informal_schema()
+    _insert_asset(conn, 1, 1, "music/healthy/song.mp3")
+    _insert_asset(conn, 2, 1, "music/broken/song.mp3")
+    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate A')")
+    conn.execute("INSERT INTO container (id, name) VALUES (11, 'Crate B')")
+    # Both broken and healthy in Crate A — UPDATE OR IGNORE will skip the
+    # broken row in A. Without explicit cleanup, that row would dangle when
+    # we delete the broken asset.
+    _insert_container_asset(conn, 10, 1)  # healthy in A
+    _insert_container_asset(conn, 10, 2)  # broken in A — conflict
+    _insert_container_asset(conn, 11, 2)  # broken in B — re-parents cleanly
+
+    csv_path = tmp_path / "fixes.csv"
+    _write_csv(csv_path, [{
+        "asset_id": "2", "location_id": "1",
+        "old_portable_id": "music/broken/song.mp3",
+        "proposed_new_portable_id": "music/healthy/song.mp3",
+        "confidence": "auto",
+    }])
+
+    apply_fixes(
+        conn, csv_path,
+        apply=True, keep_orphans=False, ambiguous_too=False,
+        repair_only=False, audit_log_path=None,
+    )
+
+    # Healthy row now lives in both crates
+    healthy_crates = sorted(
+        r["container_id"] for r in conn.execute(
+            "SELECT container_id FROM container_asset WHERE asset_id = 1"
+        )
+    )
+    assert healthy_crates == [10, 11]
+    # No dangling rows
+    dangling = conn.execute(
+        "SELECT COUNT(*) FROM container_asset "
+        "WHERE asset_id NOT IN (SELECT id FROM asset)"
+    ).fetchone()[0]
+    assert dangling == 0
     conn.close()
 
 
