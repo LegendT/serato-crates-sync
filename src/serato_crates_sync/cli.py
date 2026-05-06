@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1072,6 +1073,7 @@ class PathVerificationReport:
     auto_fix: int
     ambiguous: int
     orphan: int
+    top_broken_prefixes: list[tuple[str, int]] = field(default_factory=list)
 
 
 def portable_id_to_fs_path(portable_id: str) -> str:
@@ -1173,10 +1175,26 @@ def classify_candidates(
     return "auto" if top_score > runner_score else "ambiguous"
 
 
+def _broken_prefix_key(fs_path: str, music_root: Optional[str], depth: int = 2) -> str:
+    """Bucket key for grouping broken paths in the verify-paths summary.
+
+    If music_root is supplied, returns the first ``depth`` path components
+    *under* it (e.g. ``"DJ2/BC"`` from a path like ``.../music_root/DJ2/BC/album/track.mp3``).
+    Falls back to the first ``depth`` absolute components otherwise.
+    """
+    if music_root and fs_path.startswith(music_root):
+        rel = fs_path[len(music_root):].lstrip(os.sep)
+    else:
+        rel = fs_path.lstrip(os.sep)
+    parts = [p for p in rel.split(os.sep) if p][:-1]  # drop filename
+    return os.sep.join(parts[:depth]) if parts else "(root)"
+
+
 def verify_assets_against_filesystem(
     conn: sqlite3.Connection,
     fs_index: dict[str, list[str]],
     csv_path: Optional[Path],
+    music_root: Optional[str] = None,
     progress_every: int = 50000,
 ) -> PathVerificationReport:
     """Stream every asset row, check path existence, classify broken rows."""
@@ -1187,6 +1205,7 @@ def verify_assets_against_filesystem(
     )
 
     healthy = auto_fix = ambiguous = orphan = total = 0
+    broken_prefix_counts: dict[str, int] = {}
 
     csv_file = None
     csv_writer = None
@@ -1210,6 +1229,9 @@ def verify_assets_against_filesystem(
             if os.path.exists(fs_path):
                 healthy += 1
             else:
+                key = _broken_prefix_key(fs_path, music_root)
+                broken_prefix_counts[key] = broken_prefix_counts.get(key, 0) + 1
+
                 file_size_db = row["file_size"]
                 candidates = find_candidates(fs_path, file_size_db, fs_index)
                 confidence = classify_candidates(fs_path, candidates)
@@ -1248,12 +1270,17 @@ def verify_assets_against_filesystem(
         if csv_file is not None:
             csv_file.close()
 
+    top_prefixes = sorted(
+        broken_prefix_counts.items(), key=lambda kv: kv[1], reverse=True
+    )[:10]
+
     return PathVerificationReport(
         total_checked=total,
         healthy=healthy,
         auto_fix=auto_fix,
         ambiguous=ambiguous,
         orphan=orphan,
+        top_broken_prefixes=top_prefixes,
     )
 
 
@@ -1269,6 +1296,11 @@ def print_path_verification_report(report: PathVerificationReport) -> None:
     print(f"  auto-fix candidate:  {report.auto_fix:>10,}")
     print(f"  ambiguous:           {report.ambiguous:>10,}")
     print(f"  orphan (no match):   {report.orphan:>10,}")
+    if report.top_broken_prefixes:
+        print(f"{'-'*60}")
+        print("Top broken-path prefixes (under music root):")
+        for prefix, n in report.top_broken_prefixes:
+            print(f"  {n:>10,}  {prefix}")
     print(f"{'='*60}\n")
 
 
@@ -1299,7 +1331,9 @@ def run_verify_paths(
     print(f"Verifying assets in: {library_path}")
     conn = connect_serato_library_readonly(library_path)
     try:
-        report = verify_assets_against_filesystem(conn, fs_index, csv_path)
+        report = verify_assets_against_filesystem(
+            conn, fs_index, csv_path, music_root=str(music_root)
+        )
     finally:
         conn.close()
 
@@ -1351,7 +1385,10 @@ def backup_serato_library(library_path: Path) -> Path:
     """Create a clean snapshot of master.sqlite via SQLite's Backup API.
 
     Using the Backup API (rather than copying the file) yields a consistent
-    snapshot regardless of whether the WAL has been checkpointed.
+    snapshot regardless of whether the WAL has been checkpointed. The
+    snapshot is then opened and run through PRAGMA integrity_check so a
+    silent disk error doesn't hand us a corrupt backup we'd only notice
+    at rollback time.
     """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
@@ -1365,6 +1402,17 @@ def backup_serato_library(library_path: Path) -> Path:
             dst.close()
     finally:
         src.close()
+
+    verify = sqlite3.connect(str(backup_path))
+    try:
+        result = verify.execute("PRAGMA integrity_check").fetchone()
+    finally:
+        verify.close()
+    if not result or result[0] != "ok":
+        raise RuntimeError(
+            f"Backup integrity_check failed: {result!r}. "
+            f"Refusing to proceed with --apply."
+        )
 
     return backup_path
 
@@ -1412,13 +1460,6 @@ def get_asset_referencing_columns(
             if cname == "asset_id" and _SAFE_IDENT.match(cname) and cname not in cascade_fk_cols:
                 refs.append((t, cname, False))
     return refs
-
-
-# Backwards-compatible alias for tests that still import the old name.
-def get_asset_referencing_tables(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, str]]:
-    return [(t, c) for (t, c, _) in get_asset_referencing_columns(conn)]
 
 
 def _load_asset_maps(
@@ -1603,6 +1644,12 @@ def apply_fixes(
             "action", "merged_into_id",
         ])
 
+    # Pre-count the CSV so we can show an ETA. Cheap compared to the work
+    # we're about to do (loading asset maps, then per-row processing).
+    with csv_path.open(encoding="utf-8") as f:
+        total_rows = max(0, sum(1 for _ in f) - 1)  # subtract header
+
+    start = time.monotonic()
     next_progress = progress_every
     try:
         with csv_path.open(encoding="utf-8") as f:
@@ -1618,11 +1665,20 @@ def apply_fixes(
                     repair_only=repair_only,
                 )
                 if stats.total_csv_rows >= next_progress:
+                    elapsed = time.monotonic() - start
+                    rate = stats.total_csv_rows / elapsed if elapsed else 0
+                    if total_rows > 0 and rate > 0:
+                        remaining = max(0, total_rows - stats.total_csv_rows)
+                        eta_s = remaining / rate
+                        eta = f"  ETA {int(eta_s // 60):d}m{int(eta_s % 60):02d}s"
+                    else:
+                        eta = ""
                     print(
-                        f"  processed {stats.total_csv_rows:>8,}  "
+                        f"  processed {stats.total_csv_rows:>8,}/{total_rows:,}  "
                         f"updated {stats.updated:>7,}  "
                         f"merged {stats.merged:>7,}  "
                         f"orphans {stats.orphans_deleted:>6,}"
+                        f"  ({rate:>5,.0f}/s){eta}"
                     )
                     next_progress += progress_every
     finally:
@@ -1675,14 +1731,57 @@ def run_fix_paths(
         )
         return 1
 
+    # Resolve where the audit log will eventually live, plus a tmp file
+    # we'll atomic-rename onto it after a successful commit so a kill or
+    # rollback never leaves a stale audit log claiming work that didn't
+    # actually persist.
+    audit_tmp_path: Optional[Path] = None
+    if audit_log_path is not None:
+        if apply:
+            audit_tmp_path = audit_log_path.with_name(
+                audit_log_path.name + ".inprogress"
+            )
+        else:
+            # Dry-run: nothing to roll back, write directly.
+            audit_tmp_path = audit_log_path
+
     if apply:
         backup = backup_serato_library(library_path)
         print(f"Backup: {backup}")
         # isolation_level=None lets us drive transactions explicitly so a single
-        # BEGIN ... COMMIT spans the whole run and rolls back atomically on error.
+        # BEGIN IMMEDIATE ... COMMIT spans the whole run and rolls back
+        # atomically on error.
         conn = sqlite3.connect(str(library_path), isolation_level=None)
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("BEGIN")
+        # Verify FK enforcement actually engaged. SQLite silently no-ops
+        # unsupported pragmas; if we proceeded without it the cascade
+        # behaviour we rely on for selection_asset / dj_asset_metadata /
+        # space_asset / history_entry would not fire and we'd leak
+        # hundreds of thousands of dangling rows.
+        fk_state = conn.execute("PRAGMA foreign_keys").fetchone()
+        if not fk_state or fk_state[0] != 1:
+            conn.close()
+            logger.error(
+                "PRAGMA foreign_keys did not engage (got %r). "
+                "This SQLite build cannot enforce ON DELETE CASCADE; "
+                "refusing to proceed.",
+                fk_state,
+            )
+            return 1
+        # BEGIN IMMEDIATE acquires the write lock right away. If another
+        # process (Serato that pgrep missed, a stray shell, etc.) holds
+        # it, we get SQLITE_BUSY here rather than corrupting later.
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as e:
+            conn.close()
+            logger.error(
+                "Could not acquire write lock on master.sqlite (%s). "
+                "Another process — most likely Serato — is using it. "
+                "Quit Serato (Cmd+Q) and rerun.",
+                e,
+            )
+            return 1
     else:
         conn = connect_serato_library_readonly(library_path)
 
@@ -1694,14 +1793,28 @@ def run_fix_paths(
                 keep_orphans=keep_orphans,
                 ambiguous_too=ambiguous_too,
                 repair_only=repair_only,
-                audit_log_path=audit_log_path,
+                audit_log_path=audit_tmp_path,
             )
         except Exception:
             if apply:
                 conn.execute("ROLLBACK")
+                if audit_tmp_path is not None and audit_tmp_path.exists():
+                    audit_tmp_path.unlink()
             raise
         if apply:
             conn.execute("COMMIT")
+            # Persist WAL into the main file so a downstream copy of
+            # master.sqlite (without -wal/-shm) still reflects the fix.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            # Audit log atomically becomes visible at its final path only
+            # after commit succeeds.
+            if (
+                audit_tmp_path is not None
+                and audit_log_path is not None
+                and audit_tmp_path != audit_log_path
+                and audit_tmp_path.exists()
+            ):
+                audit_tmp_path.replace(audit_log_path)
     finally:
         conn.close()
 
@@ -1763,6 +1876,8 @@ def parse_extensions(ext_str: str) -> frozenset[str]:
 
 def main():
     """Main CLI entrypoint."""
+    from . import __version__
+
     parser = argparse.ArgumentParser(
         prog="serato-crates",
         description=(
@@ -1797,6 +1912,12 @@ Safety:
                  Serato is detected, snapshots master.sqlite via the
                  SQLite Backup API, and runs in one transaction.
 """
+    )
+
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
 
     subparsers = parser.add_subparsers(dest="command", help="Command to run")
@@ -1956,10 +2077,17 @@ Safety:
         help="Directory to write missing-assets.csv and duplicate-paths.csv (optional)"
     )
 
-    # guide command - generate manual crate creation instructions
+    # guide command - generate manual crate creation instructions.
+    # Predates `sync`, kept for users who prefer to drag-and-drop folders
+    # into Serato themselves rather than have crates written for them, or
+    # who want a printable reference of their folder hierarchy.
     guide_parser = subparsers.add_parser(
         "guide",
-        help="Generate guide for manually creating crates in Serato"
+        help=(
+            "Print step-by-step instructions for manually creating crates "
+            "in Serato (no DB writes; for users who prefer drag-and-drop "
+            "to automated sync)"
+        ),
     )
     guide_parser.add_argument(
         "--music-root", "-m",
