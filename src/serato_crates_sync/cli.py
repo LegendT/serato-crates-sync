@@ -14,8 +14,10 @@ import argparse
 import csv
 import logging
 import os
+import re
 import shutil
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -1299,6 +1301,357 @@ def run_verify_paths(
     return 0
 
 
+@dataclass
+class FixStats:
+    """Counters reported after fix-paths runs."""
+    total_csv_rows: int = 0
+    updated: int = 0
+    merged: int = 0
+    orphans_deleted: int = 0
+    skipped_ambiguous: int = 0
+    skipped_keep_orphans: int = 0
+    skipped_no_proposal: int = 0
+    skipped_repair_only_merge: int = 0
+    skipped_stale_csv: int = 0
+    skipped_unknown_confidence: int = 0
+
+
+_SAFE_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_serato_running() -> bool:
+    """Return True if a Serato DJ Pro process is found via pgrep.
+
+    Used as a guard before opening master.sqlite for writing.
+    """
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Serato DJ Pro.app"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # pgrep missing or hung — can't confirm. Treat as "not running" so the
+        # caller doesn't refuse to act; the SQLite open will surface conflicts
+        # if Serato actually has an exclusive lock.
+        return False
+    return result.returncode == 0
+
+
+def backup_serato_library(library_path: Path) -> Path:
+    """Create a clean snapshot of master.sqlite via SQLite's Backup API.
+
+    Using the Backup API (rather than copying the file) yields a consistent
+    snapshot regardless of whether the WAL has been checkpointed.
+    """
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
+
+    src = sqlite3.connect(str(library_path))
+    try:
+        dst = sqlite3.connect(str(backup_path))
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+    return backup_path
+
+
+def get_asset_referencing_tables(conn: sqlite3.Connection) -> list[tuple[str, str]]:
+    """Find every (table, column) with a FOREIGN KEY pointing at asset.id.
+
+    Used by the merge path so we can re-parent dependent rows from the
+    broken asset id to the healthy one before deleting the broken row.
+    """
+    refs: list[tuple[str, str]] = []
+    cur = conn.cursor()
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    tables = [r[0] for r in cur.fetchall()]
+    for t in tables:
+        if t == "asset" or not _SAFE_IDENT.match(t):
+            continue
+        for fk in cur.execute(f"PRAGMA foreign_key_list({t})").fetchall():
+            # fk: (id, seq, table, from, to, on_update, on_delete, match)
+            if fk[2] == "asset" and fk[4] == "id" and _SAFE_IDENT.match(fk[3]):
+                refs.append((t, fk[3]))
+    return refs
+
+
+def _load_asset_maps(
+    conn: sqlite3.Connection,
+) -> tuple[dict[int, str], dict[tuple[int, str], int]]:
+    """Snapshot the asset table into two in-memory lookup dicts.
+
+    Per-row SQL lookups are catastrophically slow for an 800k-row CSV
+    because asset's UNIQUE index on (location_id, portable_id) uses
+    COLLATE NOCASE, so a default-collation equality filter falls back
+    to a full scan. One up-front SELECT plus dict lookups is orders of
+    magnitude faster, and tolerates contention from a running Serato
+    much better.
+    """
+    id_to_portable: dict[int, str] = {}
+    path_to_id: dict[tuple[int, str], int] = {}
+    for asset_id, loc_id, pid in conn.execute(
+        "SELECT id, location_id, portable_id FROM asset"
+    ):
+        id_to_portable[asset_id] = pid
+        # Lowercase key mirrors the COLLATE NOCASE uniqueness Serato uses
+        path_to_id[(loc_id, pid.lower())] = asset_id
+    return id_to_portable, path_to_id
+
+
+def _process_fix_row(
+    conn: sqlite3.Connection,
+    row: dict,
+    ref_tables: list[tuple[str, str]],
+    stats: FixStats,
+    audit_writer,
+    id_to_portable: dict[int, str],
+    path_to_id: dict[tuple[int, str], int],
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+) -> None:
+    """Apply (or dry-run) a single CSV row of repair instructions.
+
+    Maintains the in-memory maps as it goes so later rows see the
+    consequences of earlier rows (path freed by a delete, claimed by
+    an update, etc.).
+    """
+    asset_id = int(row["asset_id"])
+    location_id = int(row["location_id"])
+    old_path = row["old_portable_id"]
+    proposed = row.get("proposed_new_portable_id", "")
+    confidence = row["confidence"]
+
+    def log(action: str, merged_into: str = "") -> None:
+        if audit_writer is not None:
+            audit_writer.writerow([
+                asset_id, old_path, proposed, action, merged_into,
+            ])
+
+    # Sanity check: the broken row must still exist with the path we recorded.
+    actual = id_to_portable.get(asset_id)
+    if actual is None or actual != old_path:
+        stats.skipped_stale_csv += 1
+        log("skipped_stale_csv")
+        return
+
+    if confidence == "orphan":
+        if keep_orphans:
+            stats.skipped_keep_orphans += 1
+            log("skipped_keep_orphans")
+            return
+        if apply:
+            conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
+        # Update maps either way so dry-run stats stay consistent
+        id_to_portable.pop(asset_id, None)
+        path_to_id.pop((location_id, old_path.lower()), None)
+        stats.orphans_deleted += 1
+        log("orphan_deleted")
+        return
+
+    if confidence == "ambiguous" and not ambiguous_too:
+        stats.skipped_ambiguous += 1
+        log("skipped_ambiguous")
+        return
+
+    if confidence not in ("auto", "ambiguous"):
+        stats.skipped_unknown_confidence += 1
+        log("skipped_unknown_confidence")
+        return
+
+    if not proposed:
+        stats.skipped_no_proposal += 1
+        log("skipped_no_proposal")
+        return
+
+    existing_id = path_to_id.get((location_id, proposed.lower()))
+    if existing_id == asset_id:
+        # Map already reports the asset under the proposed path (e.g. an
+        # earlier row updated it). Treat as a no-op skip.
+        existing_id = None
+
+    if existing_id is None:
+        if apply:
+            conn.execute(
+                "UPDATE asset SET portable_id = ? WHERE id = ?",
+                (proposed, asset_id),
+            )
+        # Maintain maps
+        id_to_portable[asset_id] = proposed
+        path_to_id.pop((location_id, old_path.lower()), None)
+        path_to_id[(location_id, proposed.lower())] = asset_id
+        stats.updated += 1
+        log("updated")
+        return
+
+    if repair_only:
+        stats.skipped_repair_only_merge += 1
+        log("skipped_repair_only_merge", str(existing_id))
+        return
+
+    if apply:
+        for table, column in ref_tables:
+            # UPDATE OR IGNORE: if (other_id, healthy_id) already exists in
+            # the dependent table, the duplicate broken-side row is left
+            # alone — it'll be removed by the subsequent CASCADE delete.
+            conn.execute(
+                f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
+                (existing_id, asset_id),
+            )
+        conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
+    # Maintain maps
+    id_to_portable.pop(asset_id, None)
+    path_to_id.pop((location_id, old_path.lower()), None)
+    # The (location_id, proposed_lower) -> existing_id mapping stays as-is.
+    stats.merged += 1
+    log("merged", str(existing_id))
+
+
+def apply_fixes(
+    conn: sqlite3.Connection,
+    csv_path: Path,
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+    audit_log_path: Optional[Path],
+    progress_every: int = 50000,
+) -> FixStats:
+    """Stream the path-fixes CSV and apply each row's repair (or dry-run)."""
+    stats = FixStats()
+    ref_tables = get_asset_referencing_tables(conn)
+
+    print("  loading asset table into memory...")
+    id_to_portable, path_to_id = _load_asset_maps(conn)
+    print(f"  loaded {len(id_to_portable):,} assets")
+
+    audit_file = None
+    audit_writer = None
+    if audit_log_path is not None:
+        audit_file = audit_log_path.open("w", newline="", encoding="utf-8")
+        audit_writer = csv.writer(audit_file)
+        audit_writer.writerow([
+            "asset_id", "old_portable_id", "proposed_new_portable_id",
+            "action", "merged_into_id",
+        ])
+
+    next_progress = progress_every
+    try:
+        with csv_path.open(encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                stats.total_csv_rows += 1
+                _process_fix_row(
+                    conn, row, ref_tables, stats, audit_writer,
+                    id_to_portable, path_to_id,
+                    apply=apply,
+                    keep_orphans=keep_orphans,
+                    ambiguous_too=ambiguous_too,
+                    repair_only=repair_only,
+                )
+                if stats.total_csv_rows >= next_progress:
+                    print(
+                        f"  processed {stats.total_csv_rows:>8,}  "
+                        f"updated {stats.updated:>7,}  "
+                        f"merged {stats.merged:>7,}  "
+                        f"orphans {stats.orphans_deleted:>6,}"
+                    )
+                    next_progress += progress_every
+    finally:
+        if audit_file is not None:
+            audit_file.close()
+
+    return stats
+
+
+def print_fix_stats(stats: FixStats, dry_run: bool) -> None:
+    """Print a summary of the fix-paths run."""
+    label = "DRY-RUN" if dry_run else "APPLIED"
+    print(f"\n{'='*60}")
+    print(f"FIX-PATHS {label}")
+    print(f"{'='*60}")
+    print(f"CSV rows processed:               {stats.total_csv_rows:>10,}")
+    print(f"  paths updated:                  {stats.updated:>10,}")
+    print(f"  rows merged into existing:      {stats.merged:>10,}")
+    print(f"  orphans deleted:                {stats.orphans_deleted:>10,}")
+    print(f"  skipped (ambiguous):            {stats.skipped_ambiguous:>10,}")
+    print(f"  skipped (kept orphans):         {stats.skipped_keep_orphans:>10,}")
+    print(f"  skipped (no proposed path):     {stats.skipped_no_proposal:>10,}")
+    print(f"  skipped (repair-only blocked merge): {stats.skipped_repair_only_merge:>5,}")
+    print(f"  skipped (CSV stale):            {stats.skipped_stale_csv:>10,}")
+    print(f"  skipped (unknown confidence):   {stats.skipped_unknown_confidence:>10,}")
+    print(f"{'='*60}\n")
+
+
+def run_fix_paths(
+    library_path: Path,
+    csv_path: Path,
+    *,
+    apply: bool,
+    keep_orphans: bool,
+    ambiguous_too: bool,
+    repair_only: bool,
+    audit_log_path: Optional[Path],
+) -> int:
+    """Apply (or dry-run) repairs from a path-fixes.csv against master.sqlite."""
+    if not library_path.exists():
+        logger.error(f"Serato library not found: {library_path}")
+        return 1
+    if not csv_path.exists():
+        logger.error(f"Path-fixes CSV not found: {csv_path}")
+        return 1
+
+    if apply and is_serato_running():
+        logger.error(
+            "Serato DJ Pro appears to be running. Quit it (Cmd+Q) and rerun."
+        )
+        return 1
+
+    if apply:
+        backup = backup_serato_library(library_path)
+        print(f"Backup: {backup}")
+        # isolation_level=None lets us drive transactions explicitly so a single
+        # BEGIN ... COMMIT spans the whole run and rolls back atomically on error.
+        conn = sqlite3.connect(str(library_path), isolation_level=None)
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN")
+    else:
+        conn = connect_serato_library_readonly(library_path)
+
+    try:
+        try:
+            stats = apply_fixes(
+                conn, csv_path,
+                apply=apply,
+                keep_orphans=keep_orphans,
+                ambiguous_too=ambiguous_too,
+                repair_only=repair_only,
+                audit_log_path=audit_log_path,
+            )
+        except Exception:
+            if apply:
+                conn.execute("ROLLBACK")
+            raise
+        if apply:
+            conn.execute("COMMIT")
+    finally:
+        conn.close()
+
+    print_fix_stats(stats, dry_run=not apply)
+    if audit_log_path is not None:
+        print(f"Audit log: {audit_log_path}\n")
+    return 0
+
+
 def run_diagnose(library_path: Path, csv_out_dir: Optional[Path]) -> int:
     """Open the Serato library read-only and report diagnostics."""
     if not library_path.exists():
@@ -1440,6 +1793,51 @@ Safety:
         help="Show detailed output including track names"
     )
 
+    # fix-paths command - apply repairs from a path-fixes.csv
+    fix_parser = subparsers.add_parser(
+        "fix-paths",
+        help="Apply repairs from path-fixes.csv to master.sqlite (Serato must be closed)"
+    )
+    fix_parser.add_argument(
+        "--from-csv",
+        type=Path,
+        required=True,
+        help="Path-fixes CSV (produced by verify-paths)"
+    )
+    fix_parser.add_argument(
+        "--library-path",
+        type=Path,
+        default=None,
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})"
+    )
+    fix_parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Actually write changes (default is dry-run)"
+    )
+    fix_parser.add_argument(
+        "--keep-orphans",
+        action="store_true",
+        help="Skip orphan rows instead of deleting them"
+    )
+    fix_parser.add_argument(
+        "--ambiguous-too",
+        action="store_true",
+        help="Apply ambiguous rows using whatever path is in the CSV "
+             "(only safe if you've reviewed the CSV)"
+    )
+    fix_parser.add_argument(
+        "--repair-only",
+        action="store_true",
+        help="Skip merges; only repair rows whose proposed path is unclaimed"
+    )
+    fix_parser.add_argument(
+        "--audit-log",
+        type=Path,
+        default=None,
+        help="Path to write the per-row audit CSV (default: alongside --from-csv)"
+    )
+
     # verify-paths command - check every asset path resolves on disk
     verify_parser = subparsers.add_parser(
         "verify-paths",
@@ -1566,6 +1964,30 @@ Safety:
         )
 
         return 0 if success else 1
+
+    elif args.command == "fix-paths":
+        library_path = args.library_path
+        if library_path is None:
+            library_path = get_default_serato_library_path()
+        else:
+            library_path = library_path.expanduser().resolve()
+
+        csv_path = args.from_csv.expanduser().resolve()
+        audit_log = args.audit_log
+        if audit_log is None:
+            audit_log = csv_path.parent / "fix-paths-applied.csv"
+        else:
+            audit_log = audit_log.expanduser().resolve()
+
+        return run_fix_paths(
+            library_path,
+            csv_path,
+            apply=args.apply,
+            keep_orphans=args.keep_orphans,
+            ambiguous_too=args.ambiguous_too,
+            repair_only=args.repair_only,
+            audit_log_path=audit_log,
+        )
 
     elif args.command == "verify-paths":
         library_path = args.library_path
