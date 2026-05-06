@@ -16,11 +16,15 @@ from serato_crates_sync.cli import (
     apply_fixes,
     backup_serato_library,
     get_asset_referencing_columns,
-    get_asset_referencing_tables,
 )
 
 
-SCHEMA = """
+# An *idealised* schema where every reference to asset.id has a formal
+# FOREIGN KEY with ON DELETE CASCADE. Real Serato schemas don't —
+# container_asset and the anonymous_table_* sort caches reference
+# asset.id by column name only. The INFORMAL_SCHEMA below tests the
+# real shape; this one tests the cascade path in isolation.
+IDEALISED_SCHEMA = """
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE asset (
@@ -49,7 +53,7 @@ CREATE TABLE container_asset (
 def _connect_with_schema():
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.executescript(SCHEMA)
+    conn.executescript(IDEALISED_SCHEMA)
     return conn
 
 
@@ -83,10 +87,12 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
             w.writerow({**{k: "" for k in w.fieldnames}, **r})
 
 
-def test_get_asset_referencing_tables_finds_container_asset():
+def test_get_asset_referencing_columns_finds_cascade_fk():
     conn = _connect_with_schema()
-    refs = get_asset_referencing_tables(conn)
-    assert ("container_asset", "asset_id") in refs
+    refs = get_asset_referencing_columns(conn)
+    # In the idealised schema both formal-FK columns are CASCADE.
+    by_table = {(t, c): cascade for (t, c, cascade) in refs}
+    assert by_table[("container_asset", "asset_id")] is True
     conn.close()
 
 

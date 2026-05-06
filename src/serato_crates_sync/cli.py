@@ -1462,13 +1462,6 @@ def get_asset_referencing_columns(
     return refs
 
 
-# Backwards-compatible alias for tests that still import the old name.
-def get_asset_referencing_tables(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, str]]:
-    return [(t, c) for (t, c, _) in get_asset_referencing_columns(conn)]
-
-
 def _load_asset_maps(
     conn: sqlite3.Connection,
 ) -> tuple[dict[int, str], dict[tuple[int, str], int]]:
