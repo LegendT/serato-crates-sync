@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1072,6 +1073,7 @@ class PathVerificationReport:
     auto_fix: int
     ambiguous: int
     orphan: int
+    top_broken_prefixes: list[tuple[str, int]] = field(default_factory=list)
 
 
 def portable_id_to_fs_path(portable_id: str) -> str:
@@ -1173,10 +1175,26 @@ def classify_candidates(
     return "auto" if top_score > runner_score else "ambiguous"
 
 
+def _broken_prefix_key(fs_path: str, music_root: Optional[str], depth: int = 2) -> str:
+    """Bucket key for grouping broken paths in the verify-paths summary.
+
+    If music_root is supplied, returns the first ``depth`` path components
+    *under* it (e.g. ``"DJ2/BC"`` from a path like ``.../music_root/DJ2/BC/album/track.mp3``).
+    Falls back to the first ``depth`` absolute components otherwise.
+    """
+    if music_root and fs_path.startswith(music_root):
+        rel = fs_path[len(music_root):].lstrip(os.sep)
+    else:
+        rel = fs_path.lstrip(os.sep)
+    parts = [p for p in rel.split(os.sep) if p][:-1]  # drop filename
+    return os.sep.join(parts[:depth]) if parts else "(root)"
+
+
 def verify_assets_against_filesystem(
     conn: sqlite3.Connection,
     fs_index: dict[str, list[str]],
     csv_path: Optional[Path],
+    music_root: Optional[str] = None,
     progress_every: int = 50000,
 ) -> PathVerificationReport:
     """Stream every asset row, check path existence, classify broken rows."""
@@ -1187,6 +1205,7 @@ def verify_assets_against_filesystem(
     )
 
     healthy = auto_fix = ambiguous = orphan = total = 0
+    broken_prefix_counts: dict[str, int] = {}
 
     csv_file = None
     csv_writer = None
@@ -1210,6 +1229,9 @@ def verify_assets_against_filesystem(
             if os.path.exists(fs_path):
                 healthy += 1
             else:
+                key = _broken_prefix_key(fs_path, music_root)
+                broken_prefix_counts[key] = broken_prefix_counts.get(key, 0) + 1
+
                 file_size_db = row["file_size"]
                 candidates = find_candidates(fs_path, file_size_db, fs_index)
                 confidence = classify_candidates(fs_path, candidates)
@@ -1248,12 +1270,17 @@ def verify_assets_against_filesystem(
         if csv_file is not None:
             csv_file.close()
 
+    top_prefixes = sorted(
+        broken_prefix_counts.items(), key=lambda kv: kv[1], reverse=True
+    )[:10]
+
     return PathVerificationReport(
         total_checked=total,
         healthy=healthy,
         auto_fix=auto_fix,
         ambiguous=ambiguous,
         orphan=orphan,
+        top_broken_prefixes=top_prefixes,
     )
 
 
@@ -1269,6 +1296,11 @@ def print_path_verification_report(report: PathVerificationReport) -> None:
     print(f"  auto-fix candidate:  {report.auto_fix:>10,}")
     print(f"  ambiguous:           {report.ambiguous:>10,}")
     print(f"  orphan (no match):   {report.orphan:>10,}")
+    if report.top_broken_prefixes:
+        print(f"{'-'*60}")
+        print("Top broken-path prefixes (under music root):")
+        for prefix, n in report.top_broken_prefixes:
+            print(f"  {n:>10,}  {prefix}")
     print(f"{'='*60}\n")
 
 
@@ -1299,7 +1331,9 @@ def run_verify_paths(
     print(f"Verifying assets in: {library_path}")
     conn = connect_serato_library_readonly(library_path)
     try:
-        report = verify_assets_against_filesystem(conn, fs_index, csv_path)
+        report = verify_assets_against_filesystem(
+            conn, fs_index, csv_path, music_root=str(music_root)
+        )
     finally:
         conn.close()
 
@@ -1617,6 +1651,12 @@ def apply_fixes(
             "action", "merged_into_id",
         ])
 
+    # Pre-count the CSV so we can show an ETA. Cheap compared to the work
+    # we're about to do (loading asset maps, then per-row processing).
+    with csv_path.open(encoding="utf-8") as f:
+        total_rows = max(0, sum(1 for _ in f) - 1)  # subtract header
+
+    start = time.monotonic()
     next_progress = progress_every
     try:
         with csv_path.open(encoding="utf-8") as f:
@@ -1632,11 +1672,20 @@ def apply_fixes(
                     repair_only=repair_only,
                 )
                 if stats.total_csv_rows >= next_progress:
+                    elapsed = time.monotonic() - start
+                    rate = stats.total_csv_rows / elapsed if elapsed else 0
+                    if total_rows > 0 and rate > 0:
+                        remaining = max(0, total_rows - stats.total_csv_rows)
+                        eta_s = remaining / rate
+                        eta = f"  ETA {int(eta_s // 60):d}m{int(eta_s % 60):02d}s"
+                    else:
+                        eta = ""
                     print(
-                        f"  processed {stats.total_csv_rows:>8,}  "
+                        f"  processed {stats.total_csv_rows:>8,}/{total_rows:,}  "
                         f"updated {stats.updated:>7,}  "
                         f"merged {stats.merged:>7,}  "
                         f"orphans {stats.orphans_deleted:>6,}"
+                        f"  ({rate:>5,.0f}/s){eta}"
                     )
                     next_progress += progress_every
     finally:
