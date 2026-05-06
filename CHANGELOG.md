@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- README restructured for first-time visitors: the landing page is
+  now ~100 lines (down from ~500), with detail relocated into a
+  `docs/` folder. Nothing removed.
+  - `docs/usage.md` — every subcommand and flag, audit-log columns,
+    verification checklist, paths-with-spaces guidance.
+  - `docs/troubleshooting.md` — common problems and rollback
+    procedures for both `sync` and `fix-paths`.
+  - `docs/internals.md` — concepts, design decisions, the Serato
+    crate format, and the `master.sqlite` vs `Subcrates/` layout.
+
 ### Added
 
 - `SECURITY.md` with vulnerability disclosure path and the safety
