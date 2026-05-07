@@ -55,6 +55,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `internals.md` links to it.
 - README and `SECURITY.md` qualify the Serato-running guard as
   macOS-only (`pgrep`); Windows / Linux are marked untested.
+- `pyproject.toml` classifiers no longer advertise Windows / Linux
+  support — only macOS is supported. The previous metadata
+  contradicted the docs.
 - `is_serato_running` matches Serato DJ Pro / DJ Lite / DJ / Studio
   (was DJ Pro only). Other Serato variants would previously slip past
   the `--apply` guard.
