@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-05-07
+
 ### Added
 
 - `SECURITY.md` with vulnerability disclosure path and the safety
@@ -42,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- README, `SECURITY.md`, `usage.md`, `troubleshooting.md`, and
+  `internals.md` corrected to reflect what `--clean` actually does
+  — it backs up `Subcrates/` and rewrites `.crate` files; it does
+  **not** clear Serato caches or touch `master.sqlite`.
+- `SECURITY.md` is now the canonical safety-invariant list (added
+  the missing WAL-checkpoint invariant); `CONTRIBUTING.md` links to
+  it instead of restating.
+- `CONTRIBUTING.md` owns the running-tests command set;
+  `internals.md` links to it.
+- README and `SECURITY.md` qualify the Serato-running guard as
+  macOS-only (`pgrep`); Windows / Linux are marked untested.
 - `is_serato_running` matches Serato DJ Pro / DJ Lite / DJ / Studio
   (was DJ Pro only). Other Serato variants would previously slip past
   the `--apply` guard.
@@ -58,6 +71,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `diagnose --csv-out` help string referenced `duplicate-paths.csv`;
+  the file actually written is `duplicate-tracks.csv` (matches what
+  was already documented in `usage.md`).
+- `troubleshooting.md` "tool can't find serato-crate" now suggests
+  `pip install -e .` (the project's editable install pulls in
+  `serato-crate` as a declared dependency); the previous
+  `pip install serato-crate` advice bypassed the project's own pin.
+- `CONTRIBUTING.md` correctly points readers to `tests/_schemas.py`
+  for `IDEALISED_SCHEMA` / `INFORMAL_SCHEMA` (the consolidation in
+  this release moved them).
 - CHANGELOG: the cli-refactor breaking note now sits under `[0.2.0]`
   where it belongs, not in `[Unreleased]`.
 - The fix-paths `--apply` smoke test no longer fails on developer
@@ -134,6 +157,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `guide` subcommand: print step-by-step instructions for manually
   creating crates in Serato.
 
-[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.3.0
 [0.2.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.2.0
 [0.1.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.1.0
