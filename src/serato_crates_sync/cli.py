@@ -146,6 +146,12 @@ Safety:
         help="Include crates for folders with no audio files",
     )
     sync_parser.add_argument(
+        "--top-level",
+        action="store_true",
+        help="Serato 4.x: place the music-root's folders as top-level crates "
+             "instead of nesting them under one crate named after the root",
+    )
+    sync_parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show detailed output including track names",
@@ -286,13 +292,28 @@ Safety:
         if music_root is None:
             return 1
 
+        extensions = parse_extensions(args.extensions)
+
+        # Serato DJ 4.x reads its library from SQLite, not Subcrates/*.crate.
+        # When a 4.x library is present, write the database directly; the
+        # legacy .crate path below is kept for Serato 3.x.
+        from .serato_db import is_serato_4x, run_sync
+
+        if is_serato_4x():
+            logger.info("Serato 4.x library detected — using the SQLite crate engine.")
+            return run_sync(
+                music_root,
+                extensions=extensions,
+                apply=args.apply,
+                top_level=args.top_level,
+                include_empty=args.include_empty,
+            )
+
         serato_root = args.serato_root
         if serato_root is None:
             serato_root = get_default_serato_root()
         else:
             serato_root = serato_root.expanduser().resolve()
-
-        extensions = parse_extensions(args.extensions)
 
         logger.info(f"Scanning music folder: {music_root}")
         plan = create_sync_plan(

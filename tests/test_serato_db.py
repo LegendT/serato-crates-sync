@@ -4,6 +4,7 @@ Builds a faithful minimal root.sqlite fixture (tables, the container UNIQUE
 constraint, and foreign keys) and exercises the additive mirror against a
 real on-disk folder tree.
 """
+import json
 import sqlite3
 
 import pytest
@@ -292,3 +293,45 @@ def test_merge_manifest_merges_without_overwriting():
     assert m["roots"]["/music"] == [1, 2, 3]
     assert serato_db.owned_ids_for(m, "/music") == {1, 2, 3}
     assert serato_db.owned_ids_for(m, "/other") == set()
+
+
+def _count(db, name):
+    c = sqlite3.connect(db)
+    try:
+        return c.execute("SELECT count(*) FROM container WHERE name=?", (name,)).fetchone()[0]
+    finally:
+        c.close()
+
+
+def test_run_sync_dry_run_then_apply_then_idempotent(root_db, music_tree, monkeypatch, tmp_path):
+    """End-to-end orchestrator: dry-run writes nothing, apply writes + manifest,
+    re-run is idempotent."""
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: root_db.parent)
+    monkeypatch.setattr(serato_db, "get_master_db_path", lambda: tmp_path / "master.sqlite")
+    monkeypatch.setattr(serato_db, "is_serato_running", lambda: False)
+    manifest_file = root_db.parent / serato_db.MANIFEST_DIRNAME / serato_db.MANIFEST_FILENAME
+
+    # dry-run: nothing written, no manifest
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=False) == 0
+    assert _count(root_db, "House") == 0
+    assert not manifest_file.exists()
+
+    # apply: crates written, manifest records the 4 created containers
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 0
+    assert _count(root_db, "House") == 1
+    manifest = json.loads(manifest_file.read_text())
+    assert len(manifest["roots"][str(music_tree)]) == 4
+
+    # re-run apply: no duplicates, manifest count unchanged
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 0
+    assert _count(root_db, "House") == 1
+    manifest = json.loads(manifest_file.read_text())
+    assert len(manifest["roots"][str(music_tree)]) == 4
+
+
+def test_run_sync_refuses_while_serato_running(root_db, music_tree, monkeypatch, tmp_path):
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: root_db.parent)
+    monkeypatch.setattr(serato_db, "get_master_db_path", lambda: tmp_path / "master.sqlite")
+    monkeypatch.setattr(serato_db, "is_serato_running", lambda: True)
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 1
+    assert _count(root_db, "House") == 0  # nothing written

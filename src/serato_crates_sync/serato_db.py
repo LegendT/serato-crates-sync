@@ -18,13 +18,15 @@ duplicating them, and only ever treat tool-created crates as removable.
 """
 
 import json
+import shutil
 import sqlite3
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
-from .library import get_default_serato_library_path, logger
-from .sync import CratePlan
+from .library import get_default_serato_library_path, is_serato_running, logger
+from .sync import CratePlan, build_crate_tree
 
 __all__ = [
     "REQUIRED_TABLES",
@@ -33,7 +35,9 @@ __all__ = [
     "SyncResult",
     "get_serato_library_dir",
     "get_root_db_path",
+    "get_master_db_path",
     "is_serato_4x",
+    "run_sync",
     "assert_serato_4x_schema",
     "discover_anchors",
     "build_asset_index",
@@ -88,6 +92,11 @@ def get_serato_library_dir() -> Path:
 def get_root_db_path() -> Path:
     """Path to root.sqlite (the authoritative Serato Library space store)."""
     return get_serato_library_dir() / "root.sqlite"
+
+
+def get_master_db_path() -> Path:
+    """Path to master.sqlite (the aggregate Serato rebuilds from the spaces)."""
+    return get_default_serato_library_path()
 
 
 def is_serato_4x() -> bool:
@@ -384,3 +393,110 @@ def mirror_tree(
     else:
         walk(tree, anchors.root_container_id)
     return result
+
+
+# --- Orchestrator ----------------------------------------------------------
+
+def _backup_db(path: Path, timestamp: str) -> Path | None:
+    """Copy a DB file to a timestamped sibling. Returns the backup path."""
+    if not path.exists():
+        return None
+    backup = path.with_name(f"{path.name}.BACKUP.{timestamp}")
+    shutil.copy2(path, backup)
+    return backup
+
+
+def _print_report(result: SyncResult, *, music_root: Path, apply: bool) -> None:
+    print(f"\n{'=' * 60}")
+    print("SERATO 4.x CRATE SYNC")
+    print(f"{'=' * 60}")
+    print(f"Music root:  {music_root}")
+    print(f"Crates:      {result.crates_created} to create, "
+          f"{result.crates_reused} reused, {result.crates_skipped_foreign} skipped (not ours)")
+    print(f"Tracks:      {result.tracks_added} to add, "
+          f"{result.tracks_already_present} already present")
+    print(f"New assets:  {result.assets_created} (tracks not yet in your Serato library)")
+    if result.skipped_foreign_names:
+        shown = ", ".join(result.skipped_foreign_names[:10])
+        more = "" if len(result.skipped_foreign_names) <= 10 else \
+            f" (+{len(result.skipped_foreign_names) - 10} more)"
+        print(f"\nSkipped existing crates you created (left untouched): {shown}{more}")
+    print()
+    if not apply:
+        print("DRY RUN — no changes written. Add --apply to write.")
+    else:
+        print("Applied. Quit-and-relaunch Serato to see the crates; it will "
+              "analyse any new tracks.")
+
+
+def run_sync(
+    music_root: Path,
+    *,
+    extensions,
+    apply: bool = False,
+    top_level: bool = False,
+    include_empty: bool = False,
+) -> int:
+    """Mirror ``music_root`` into the Serato 4.x SQLite library. Returns exit code.
+
+    Writes ``root.sqlite`` only (Serato aggregates into ``master.sqlite`` on
+    launch). Dry-run by default. With ``apply`` it refuses to run while Serato
+    is open, backs up both databases, and writes inside one transaction with an
+    integrity check and a WAL checkpoint.
+    """
+    root_db = get_root_db_path()
+    if not root_db.exists():
+        logger.error(f"No Serato 4.x library found at {root_db}")
+        return 1
+
+    if apply and is_serato_running():
+        logger.error("Serato is running — quit it before writing. Aborting.")
+        return 1
+
+    tree = build_crate_tree(music_root, extensions, include_empty=include_empty)
+    if tree is None:
+        logger.warning(f"No audio files found under {music_root} — nothing to sync.")
+        return 0
+
+    backups = []
+    if apply:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for db in (root_db, get_master_db_path()):
+            b = _backup_db(db, ts)
+            if b:
+                backups.append(b)
+                print(f"Backup created: {b}")
+
+    conn = sqlite3.connect(root_db, timeout=60)
+    conn.isolation_level = None  # explicit transaction control
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        assert_serato_4x_schema(conn)
+        anchors = discover_anchors(conn)
+        index = build_asset_index(conn, anchors.space_id)
+        manifest = load_manifest()
+        owned = owned_ids_for(manifest, music_root)
+
+        conn.execute("BEGIN")
+        revision = bump_revision(conn)
+        result = mirror_tree(
+            conn, tree, anchors, index, revision=revision,
+            owned_container_ids=owned, top_level=top_level,
+        )
+        validate_integrity(conn, quick=True)
+
+        if apply:
+            conn.execute("COMMIT")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            merge_manifest(manifest, music_root, result.created_container_ids)
+            save_manifest(manifest)
+        else:
+            conn.execute("ROLLBACK")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+    _print_report(result, music_root=music_root, apply=apply)
+    return 0
