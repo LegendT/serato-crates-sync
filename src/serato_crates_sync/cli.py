@@ -152,6 +152,11 @@ Safety:
              "instead of nesting them under one crate named after the root",
     )
     sync_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="Serato 4.x: skip the confirmation prompt for large writes",
+    )
+    sync_parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show detailed output including track names",
@@ -301,12 +306,18 @@ Safety:
 
         if is_serato_4x():
             logger.info("Serato 4.x library detected — using the SQLite crate engine.")
+            # These flags only apply to the legacy 3.x .crate path (O6).
+            if args.clean:
+                logger.warning("--clean is not yet supported on Serato 4.x (prune is planned) — ignoring.")
+            if args.overwrite or args.path_mode != "absolute" or args.subcrate_delimiter != "%%":
+                logger.warning("--overwrite/--path-mode/--subcrate-delimiter are Serato 3.x-only — ignoring on 4.x.")
             return run_sync(
                 music_root,
                 extensions=extensions,
                 apply=args.apply,
                 top_level=args.top_level,
                 include_empty=args.include_empty,
+                assume_yes=args.yes,
             )
 
         serato_root = args.serato_root

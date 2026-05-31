@@ -316,14 +316,18 @@ def test_run_sync_dry_run_then_apply_then_idempotent(root_db, music_tree, monkey
     assert _count(root_db, "House") == 0
     assert not manifest_file.exists()
 
-    # apply: crates written, manifest records the 4 created containers
-    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 0
+    # apply (assume_yes — creating assets is a "large" change): crates written,
+    # manifest records the 4 created containers, and a backup is made (O9)
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                              apply=True, assume_yes=True) == 0
     assert _count(root_db, "House") == 1
     manifest = json.loads(manifest_file.read_text())
     assert len(manifest["roots"][str(music_tree)]) == 4
+    assert list(root_db.parent.glob("root.sqlite.BACKUP.*"))  # O9
 
     # re-run apply: no duplicates, manifest count unchanged
-    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 0
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                              apply=True, assume_yes=True) == 0
     assert _count(root_db, "House") == 1
     manifest = json.loads(manifest_file.read_text())
     assert len(manifest["roots"][str(music_tree)]) == 4
@@ -335,3 +339,27 @@ def test_run_sync_refuses_while_serato_running(root_db, music_tree, monkeypatch,
     monkeypatch.setattr(serato_db, "is_serato_running", lambda: True)
     assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True) == 1
     assert _count(root_db, "House") == 0  # nothing written
+
+
+def test_run_sync_aborts_large_change_without_yes(root_db, music_tree, monkeypatch, tmp_path):
+    """O1: a large change (creates assets) is not written without --yes when
+    non-interactive."""
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: root_db.parent)
+    monkeypatch.setattr(serato_db, "get_master_db_path", lambda: tmp_path / "master.sqlite")
+    monkeypatch.setattr(serato_db, "is_serato_running", lambda: False)
+    monkeypatch.setattr(serato_db.sys.stdin, "isatty", lambda: False)
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                              apply=True, assume_yes=False) == 0
+    assert _count(root_db, "House") == 0  # aborted, nothing written
+
+
+def test_run_sync_clean_error_on_non_serato_db(tmp_path, music_tree, monkeypatch):
+    """O2: a non-Serato DB yields a clean exit code, not a traceback."""
+    db = tmp_path / "root.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE foo (id INTEGER)")
+    c.commit()
+    c.close()
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: tmp_path)
+    monkeypatch.setattr(serato_db, "is_serato_running", lambda: False)
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=False) == 1

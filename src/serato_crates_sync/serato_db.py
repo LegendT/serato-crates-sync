@@ -20,6 +20,7 @@ duplicating them, and only ever treat tool-created crates as removable.
 import json
 import shutil
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -397,10 +398,25 @@ def mirror_tree(
 
 # --- Orchestrator ----------------------------------------------------------
 
+# A change is "large" enough to confirm before writing if it creates assets
+# (touches the library beyond crate grouping) or many crates.
+LARGE_CRATE_THRESHOLD = 500
+
+
 def _backup_db(path: Path, timestamp: str) -> Path | None:
-    """Copy a DB file to a timestamped sibling. Returns the backup path."""
+    """Copy a DB file to a timestamped sibling, after folding any WAL in (O4).
+
+    A ``PRAGMA wal_checkpoint(TRUNCATE)`` first ensures the main file is a
+    complete snapshot before the copy (Serato is quit, so this is safe).
+    """
     if not path.exists():
         return None
+    try:
+        c = sqlite3.connect(path, timeout=60)
+        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        c.close()
+    except sqlite3.Error:
+        pass  # no WAL / already consistent
     backup = path.with_name(f"{path.name}.BACKUP.{timestamp}")
     shutil.copy2(path, backup)
     return backup
@@ -408,7 +424,7 @@ def _backup_db(path: Path, timestamp: str) -> Path | None:
 
 def _print_report(result: SyncResult, *, music_root: Path, apply: bool) -> None:
     print(f"\n{'=' * 60}")
-    print("SERATO 4.x CRATE SYNC")
+    print("SERATO 4.x CRATE SYNC" + ("" if apply else " (preview)"))
     print(f"{'=' * 60}")
     print(f"Music root:  {music_root}")
     print(f"Crates:      {result.crates_created} to create, "
@@ -422,11 +438,73 @@ def _print_report(result: SyncResult, *, music_root: Path, apply: bool) -> None:
             f" (+{len(result.skipped_foreign_names) - 10} more)"
         print(f"\nSkipped existing crates you created (left untouched): {shown}{more}")
     print()
-    if not apply:
-        print("DRY RUN — no changes written. Add --apply to write.")
-    else:
-        print("Applied. Quit-and-relaunch Serato to see the crates; it will "
-              "analyse any new tracks.")
+
+
+def _sync_pass(
+    root_db: Path,
+    tree,
+    music_root: Path,
+    *,
+    top_level: bool,
+    commit: bool,
+) -> SyncResult:
+    """One mirror pass. ``commit=False`` rolls back (preview, writes nothing);
+    ``commit=True`` commits, checkpoints, and persists the manifest.
+
+    Raises ``ValueError`` / ``sqlite3.Error`` on schema or integrity problems;
+    the caller turns those into a clean exit code (O2).
+    """
+    conn = sqlite3.connect(root_db, timeout=60)
+    conn.isolation_level = None  # explicit transaction control
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        assert_serato_4x_schema(conn)              # validate before any backup (O3)
+        anchors = discover_anchors(conn)
+        index = build_asset_index(conn, anchors.space_id)
+        manifest = load_manifest()
+        owned = owned_ids_for(manifest, music_root)
+
+        conn.execute("BEGIN IMMEDIATE")            # grab the write lock up front (O5)
+        revision = bump_revision(conn)
+        result = mirror_tree(
+            conn, tree, anchors, index, revision=revision,
+            owned_container_ids=owned, top_level=top_level,
+        )
+        validate_integrity(conn, quick=True)
+
+        if commit:
+            conn.execute("COMMIT")
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            merge_manifest(manifest, music_root, result.created_container_ids)
+            try:
+                save_manifest(manifest)
+            except OSError as e:  # committed, but manifest not recorded (O7)
+                logger.error(
+                    f"Crates written but manifest save failed ({e}). Created "
+                    f"container ids (record these for re-run/clean): "
+                    f"{result.created_container_ids}"
+                )
+        else:
+            conn.execute("ROLLBACK")
+        return result
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
+def _confirm_large(result: SyncResult) -> bool:
+    """Interactive confirmation for a large write; refuse non-interactively."""
+    if not sys.stdin.isatty():
+        logger.error(
+            "Large change (creates assets or many crates) — re-run with --yes "
+            "to apply non-interactively."
+        )
+        return False
+    prompt = (f"Create {result.crates_created} crates and {result.assets_created} "
+              f"new library tracks? [y/N] ")
+    return input(prompt).strip().lower() in ("y", "yes")
 
 
 def run_sync(
@@ -436,13 +514,15 @@ def run_sync(
     apply: bool = False,
     top_level: bool = False,
     include_empty: bool = False,
+    assume_yes: bool = False,
 ) -> int:
     """Mirror ``music_root`` into the Serato 4.x SQLite library. Returns exit code.
 
     Writes ``root.sqlite`` only (Serato aggregates into ``master.sqlite`` on
     launch). Dry-run by default. With ``apply`` it refuses to run while Serato
-    is open, backs up both databases, and writes inside one transaction with an
-    integrity check and a WAL checkpoint.
+    is open; runs a preview pass first, shows the plan, confirms large changes
+    (unless ``assume_yes``), backs up both databases, then writes inside one
+    ``BEGIN IMMEDIATE`` transaction with an integrity check and WAL checkpoint.
     """
     root_db = get_root_db_path()
     if not root_db.exists():
@@ -458,45 +538,44 @@ def run_sync(
         logger.warning(f"No audio files found under {music_root} — nothing to sync.")
         return 0
 
-    backups = []
-    if apply:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        for db in (root_db, get_master_db_path()):
-            b = _backup_db(db, ts)
-            if b:
-                backups.append(b)
-                print(f"Backup created: {b}")
-
-    conn = sqlite3.connect(root_db, timeout=60)
-    conn.isolation_level = None  # explicit transaction control
+    # Preview pass: writes nothing, gives accurate counts for the report/confirm.
+    # (At full scale this is one pass; an --apply additionally re-runs the
+    # write pass below. A count-only preview is a future optimisation — see C3.)
     try:
-        conn.execute("PRAGMA foreign_keys = ON")
-        assert_serato_4x_schema(conn)
-        anchors = discover_anchors(conn)
-        index = build_asset_index(conn, anchors.space_id)
-        manifest = load_manifest()
-        owned = owned_ids_for(manifest, music_root)
-
-        conn.execute("BEGIN")
-        revision = bump_revision(conn)
-        result = mirror_tree(
-            conn, tree, anchors, index, revision=revision,
-            owned_container_ids=owned, top_level=top_level,
-        )
-        validate_integrity(conn, quick=True)
-
-        if apply:
-            conn.execute("COMMIT")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            merge_manifest(manifest, music_root, result.created_container_ids)
-            save_manifest(manifest)
-        else:
-            conn.execute("ROLLBACK")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
-    finally:
-        conn.close()
+        result = _sync_pass(root_db, tree, music_root, top_level=top_level, commit=False)
+    except (ValueError, sqlite3.Error) as e:
+        logger.error(f"Sync failed: {e}")
+        return 1
 
     _print_report(result, music_root=music_root, apply=apply)
+
+    if not apply:
+        print("DRY RUN — no changes written. Add --apply to write.")
+        return 0
+
+    if result.crates_created == 0 and result.tracks_added == 0:
+        print("Nothing new to write.")
+        return 0
+
+    # O1: confirm large changes before writing, unless --yes
+    is_large = result.assets_created > 0 or result.crates_created > LARGE_CRATE_THRESHOLD
+    if is_large and not assume_yes:
+        if not _confirm_large(result):
+            print("Aborted — nothing written.")
+            return 0
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for db in (root_db, get_master_db_path()):
+        b = _backup_db(db, ts)
+        if b:
+            print(f"Backup created: {b}")
+
+    try:
+        _sync_pass(root_db, tree, music_root, top_level=top_level, commit=True)
+    except (ValueError, sqlite3.Error) as e:
+        logger.error(f"Apply failed (rolled back, library unchanged): {e}")
+        return 1
+
+    print("Applied. Quit-and-relaunch Serato to see the crates; it will "
+          "analyse any new tracks.")
     return 0
