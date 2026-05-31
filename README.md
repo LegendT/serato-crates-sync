@@ -38,16 +38,27 @@ write-lock check alone.
 ### Generate crates from a folder hierarchy
 
 ```bash
-serato-crates sync --music-root ~/Music/DJ           # dry-run
+serato-crates sync --music-root ~/Music/DJ           # dry-run preview
 serato-crates sync --music-root ~/Music/DJ --apply   # write
 ```
 
-Folders become crates, subfolders become subcrates with a `%%`
-delimiter (`House%%Deep.crate`).
+Folders become crates and subfolders become nested subcrates, mirroring
+your tree.
 
-A `./sync.sh` wrapper is also included for the common case (defaults
-to `~/Music/DJ`, activates the venv, passes flags through). See
-[docs/usage.md](docs/usage.md#sync) for details.
+**On Serato DJ Pro 4.x** (a `root.sqlite` library is present) `sync`
+writes the SQLite library directly: it creates the crates and imports any
+tracks not already in your library, which Serato then analyses on next
+launch. Serato must be quit for `--apply`. Re-runs are additive and
+idempotent; `--prune` removes crates whose source folder you've deleted.
+(Serato 4.x ignores the legacy `.crate` files, so writing them has no
+effect — this is why the database route is used.)
+
+**On Serato 3.x** `sync` writes legacy `Subcrates/*.crate` files
+(subcrates as `House%%Deep.crate`), the format 3.x reads.
+
+A `./sync.sh` wrapper is included for the common case (activates the venv,
+passes flags through). See [docs/usage.md](docs/usage.md#sync) for the
+full flag list.
 
 ### Audit library health (read-only)
 

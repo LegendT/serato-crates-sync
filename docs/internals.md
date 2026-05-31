@@ -7,6 +7,7 @@ usage see [usage.md](usage.md).
 - [Concepts: where Serato keeps things](#concepts)
 - [What `--clean` does](#what---clean-does)
 - [Design decisions](#design-decisions)
+  - [Serato 4.x crate engine](#serato-4x-crate-engine)
 - [Serato crate file format](#serato-crate-file-format)
 - [Track metadata (BPM, key, etc.)](#track-metadata)
 - [Running tests](#running-tests)
@@ -16,14 +17,17 @@ usage see [usage.md](usage.md).
 Serato keeps two largely independent stores on disk:
 
 - **`~/Music/_Serato_/Subcrates/`** — one binary `.crate` file per
-  crate / subcrate. The Subcrates folder is what `sync` writes to and
-  what the `Subcrates.BACKUP.<timestamp>` rollback restores.
-- **`~/Library/Application Support/Serato/Library/master.sqlite`** —
-  the SQLite library that holds asset rows (one per file path Serato
-  has indexed), crate membership, smart-crate rules, and library
-  preferences. This is what `diagnose`, `verify-paths`, and `fix-paths`
-  read or modify. Rolling back `fix-paths` means restoring the
-  `master.sqlite.BACKUP.<timestamp>` snapshot taken before the run.
+  crate / subcrate. On **Serato 3.x** this is what `sync` writes (and
+  what `Subcrates.BACKUP.<timestamp>` restores). **Serato 4.x ignores
+  these for its live crate panel** — they are a backwards-compat artefact.
+- **`~/Library/Application Support/Serato/Library/`** — the SQLite
+  library. `master.sqlite` is the aggregate Serato opens (asset rows —
+  one per indexed file path — crate membership, smart-crate rules, and
+  preferences); `diagnose`, `verify-paths`, and `fix-paths` read/modify
+  it. On **Serato 4.x**, `root.sqlite` is the authoritative,
+  revision-tracked "Serato Library" space store that `sync` writes to
+  create crates and import tracks; Serato aggregates it into
+  `master.sqlite` on launch. See [Serato 4.x crate engine](#serato-4x-crate-engine).
 
 There's also a legacy `~/Music/_Serato_/database V2` file from older
 Serato versions; this tool does not touch it directly. On Serato DJ
@@ -77,11 +81,46 @@ use `diagnose` and `fix-paths` instead.
 ### Why `master.sqlite` paths drop the leading slash
 
 Serato's internal convention stores paths as e.g.
-`Users/anthonygeorge/Music/...` (no leading slash). Our `sync` writes
+`Users/you/Music/...` (no leading slash). Our `sync` writes
 crate paths in the same format so loading a track via a `.crate` file
 matches the same `asset.id` that Serato would create on its own. This
 prevents duplicate asset rows when the same file is loaded via two
 different code paths.
+
+### Serato 4.x crate engine
+
+Serato DJ Pro 4.x moved its library to SQLite and no longer reads
+`Subcrates/*.crate` for the live crate panel, so the legacy `sync`
+output is invisible to it. `serato_db.py` instead writes the database
+directly:
+
+- **Two databases.** `root.sqlite` is the authoritative, revision-tracked
+  store for the "Serato Library" space; `master.sqlite` is a rebuildable
+  aggregate Serato opens. `sync` writes only `root.sqlite` (and bumps its
+  `serato.revision`); on next launch Serato detects the higher revision
+  and aggregates the change into `master.sqlite` itself, linking the rows
+  via `external_container_id` / `external_container_asset_id`.
+- **Rows per crate.** A crate is a `container` row (folders nest via
+  `parent_id`, never `%%` filenames). Membership is a `container_asset`
+  row pointing at a `space_asset` (asset ↔ space), which points at an
+  `asset` (the track). Anchors — the "Serato Library" space id and its
+  root container — are discovered by name/shape, never hardcoded.
+- **Importing tracks.** A file not yet in the library is added as an
+  `asset` (only `revision` and `portable_id` lack usable defaults) plus
+  a `space_asset`; Serato reads the file and analyses it (BPM/key) on
+  launch. `portable_id` is the volume-relative path (no leading slash),
+  matching Serato's own convention so no duplicate asset is created.
+- **Revision triggers.** `root.sqlite` has `track_space_changes_when_*`
+  triggers that advance `space.revision` on insert/delete; the engine
+  only bumps the global `serato.revision` and stamps new rows.
+- **Idempotent re-runs + ownership.** A manifest
+  (`.serato-crates-sync/manifest.json`) records the container ids the
+  tool created, per music root. Re-runs reuse those crates and dedupe
+  memberships; `--prune` / `--clean` only ever remove manifest-recorded
+  crates, so user-made crates are never touched.
+- **Safety.** Dry-run by default; refuses to write while Serato is open;
+  `BEGIN IMMEDIATE` + `foreign_key_check`/`quick_check` + WAL checkpoint;
+  timestamped backups of both databases before any write.
 
 ### Why `fix-paths` loads the asset table into memory
 
