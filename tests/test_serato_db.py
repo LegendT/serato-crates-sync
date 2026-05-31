@@ -380,3 +380,59 @@ def test_mirror_dry_run_counts_without_writing(root_db, music_tree):
     assert conn.execute("SELECT count(*) FROM container WHERE name='House'").fetchone()[0] == 0
     assert conn.execute("SELECT count(*) FROM asset").fetchone()[0] == 0
     conn.close()
+
+
+def _setup_live(root_db, tmp_path, monkeypatch):
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: root_db.parent)
+    monkeypatch.setattr(serato_db, "get_master_db_path", lambda: tmp_path / "master.sqlite")
+    monkeypatch.setattr(serato_db, "is_serato_running", lambda: False)
+
+
+def test_run_prune_removes_stale_crate(root_db, music_tree, monkeypatch, tmp_path):
+    import shutil
+    _setup_live(root_db, tmp_path, monkeypatch)
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    assert _count(root_db, "Techno") == 1 and _count(root_db, "House") == 1
+
+    shutil.rmtree(music_tree / "Techno")  # folder deleted on disk
+    assert serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                               apply=True, assume_yes=True) == 0
+    assert _count(root_db, "Techno") == 0   # stale crate pruned
+    assert _count(root_db, "House") == 1    # current crate kept
+
+
+def test_run_clean_removes_all_tool_crates(root_db, music_tree, monkeypatch, tmp_path):
+    _setup_live(root_db, tmp_path, monkeypatch)
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    assert serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                               clean=True, apply=True, assume_yes=True) == 0
+    for name in ("DJ", "House", "Deep", "Techno"):
+        assert _count(root_db, name) == 0
+    manifest_file = root_db.parent / serato_db.MANIFEST_DIRNAME / serato_db.MANIFEST_FILENAME
+    assert json.loads(manifest_file.read_text())["roots"][str(music_tree)] == []
+
+
+def test_run_prune_dry_run_writes_nothing(root_db, music_tree, monkeypatch, tmp_path):
+    import shutil
+    _setup_live(root_db, tmp_path, monkeypatch)
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    shutil.rmtree(music_tree / "Techno")
+    assert serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=False) == 0
+    assert _count(root_db, "Techno") == 1  # dry-run wrote nothing
+
+
+def test_run_prune_leaves_user_crate(root_db, music_tree, monkeypatch, tmp_path):
+    """clean removes only manifest-recorded crates, never a user-made one."""
+    _setup_live(root_db, tmp_path, monkeypatch)
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    # user adds their own crate under the library root
+    c = _connect(root_db)
+    anchors = serato_db.discover_anchors(c)
+    c.execute("INSERT INTO container (id,revision,parent_id,name,type,list_order,space_id,"
+              "time_added,expanded,portable_id,color) VALUES (9999,1,?,'MyCrate',1,99,2,0,0,'',NULL)",
+              (anchors.root_container_id,))
+    c.commit()
+    c.close()
+    serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                        clean=True, apply=True, assume_yes=True)
+    assert _count(root_db, "MyCrate") == 1  # untouched

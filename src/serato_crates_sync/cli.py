@@ -157,6 +157,12 @@ Safety:
         help="Serato 4.x: skip the confirmation prompt for large writes",
     )
     sync_parser.add_argument(
+        "--prune",
+        action="store_true",
+        help="Serato 4.x: remove tool-created crates whose source folder no "
+             "longer exists on disk (reconciliation; never touches your own crates)",
+    )
+    sync_parser.add_argument(
         "--verbose", "-v",
         action="store_true",
         help="Show detailed output including track names",
@@ -302,15 +308,23 @@ Safety:
         # Serato DJ 4.x reads its library from SQLite, not Subcrates/*.crate.
         # When a 4.x library is present, write the database directly; the
         # legacy .crate path below is kept for Serato 3.x.
-        from .serato_db import is_serato_4x, run_sync
+        from .serato_db import is_serato_4x, run_prune, run_sync
 
         if is_serato_4x():
             logger.info("Serato 4.x library detected — using the SQLite crate engine.")
             # These flags only apply to the legacy 3.x .crate path (O6).
-            if args.clean:
-                logger.warning("--clean is not yet supported on Serato 4.x (prune is planned) — ignoring.")
             if args.overwrite or args.path_mode != "absolute" or args.subcrate_delimiter != "%%":
                 logger.warning("--overwrite/--path-mode/--subcrate-delimiter are Serato 3.x-only — ignoring on 4.x.")
+            if args.prune or args.clean:
+                # --prune removes stale crates; --clean removes all tool-created crates
+                return run_prune(
+                    music_root,
+                    extensions=extensions,
+                    clean=(args.clean and not args.prune),
+                    apply=args.apply,
+                    top_level=args.top_level,
+                    assume_yes=args.yes,
+                )
             return run_sync(
                 music_root,
                 extensions=extensions,

@@ -50,6 +50,7 @@ __all__ = [
     "bump_revision",
     "validate_integrity",
     "mirror_tree",
+    "run_prune",
 ]
 
 
@@ -612,4 +613,146 @@ def run_sync(
 
     print("Applied. Quit-and-relaunch Serato to see the crates; it will "
           "analyse any new tracks.")
+    return 0
+
+
+# --- Prune / clean ---------------------------------------------------------
+
+def _desired_crate_paths(tree, top_level: bool) -> set:
+    """The set of crate name-paths (tuples from the library root) the current
+    folder tree would produce — used to detect stale crates."""
+    desired: set = set()
+    if tree is None:
+        return desired
+
+    def walk(plan, prefix):
+        path = prefix + (plan.name,)
+        desired.add(path)
+        for child in plan.children:
+            walk(child, path)
+
+    if top_level:
+        for child in tree.children:
+            walk(child, ())
+        if tree.tracks:
+            desired.add((tree.name,))
+    else:
+        walk(tree, ())
+    return desired
+
+
+def _container_path(conn: sqlite3.Connection, cid: int, root_id: int):
+    """Reconstruct a container's name-path (tuple from the library root), or None
+    if it no longer exists."""
+    names = []
+    cur = cid
+    while cur is not None and cur != root_id:
+        row = conn.execute("SELECT name, parent_id FROM container WHERE id=?", (cur,)).fetchone()
+        if row is None:
+            return None
+        names.append(row[0])
+        cur = row[1]
+    return tuple(reversed(names))
+
+
+def run_prune(
+    music_root: Path,
+    *,
+    extensions,
+    clean: bool = False,
+    apply: bool = False,
+    top_level: bool = False,
+    assume_yes: bool = False,
+) -> int:
+    """Remove tool-created crates from the Serato 4.x library. Returns exit code.
+
+    ``clean=False`` (prune): remove only crates whose source folder no longer
+    exists on disk. ``clean=True``: remove every crate the tool created for this
+    music root. Only crates recorded in the manifest are ever touched — never
+    user-made crates. Created assets are retained (they are valid library
+    tracks). Removes from ``root.sqlite``; Serato reconciles ``master.sqlite``
+    on next launch (the same revision mechanism that propagates creates).
+    """
+    action = "clean" if clean else "prune"
+    root_db = get_root_db_path()
+    if not root_db.exists():
+        logger.error(f"No Serato 4.x library found at {root_db}")
+        return 1
+    if apply and is_serato_running():
+        logger.error("Serato is running — quit it before writing. Aborting.")
+        return 1
+
+    manifest = load_manifest()
+    owned = owned_ids_for(manifest, music_root)
+    if not owned:
+        logger.warning(f"No tool-created crates recorded for {music_root} — nothing to {action}.")
+        return 0
+
+    try:
+        ro = sqlite3.connect(f"{root_db.as_uri()}?mode=ro", uri=True, timeout=60)
+        try:
+            ro.execute("PRAGMA busy_timeout=5000")
+            assert_serato_4x_schema(ro)
+            anchors = discover_anchors(ro)
+            if clean:
+                targets = [c for c in owned
+                           if ro.execute("SELECT 1 FROM container WHERE id=?", (c,)).fetchone()]
+            else:
+                desired = _desired_crate_paths(
+                    build_crate_tree(music_root, extensions), top_level)
+                targets = [c for c in owned
+                           if (p := _container_path(ro, c, anchors.root_container_id)) is not None
+                           and p not in desired]
+        finally:
+            ro.close()
+    except (ValueError, sqlite3.Error) as e:
+        logger.error(f"{action.capitalize()} failed: {e}")
+        return 1
+
+    print(f"\n{action.upper()}: {len(targets)} tool-created crate(s) to remove for {music_root}")
+    if not apply:
+        print(f"DRY RUN — no changes written. Add --apply to {action}.")
+        return 0
+    if not targets:
+        print("Nothing to remove.")
+        return 0
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            logger.error("Removal — re-run with --yes to proceed non-interactively.")
+            return 0
+        if input(f"Remove {len(targets)} crate(s)? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("Aborted — nothing removed.")
+            return 0
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for db in (root_db, get_master_db_path()):
+        b = _backup_db(db, ts)
+        if b:
+            print(f"Backup created: {b}")
+
+    conn = sqlite3.connect(root_db, timeout=60)
+    conn.isolation_level = None
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("PRAGMA recursive_triggers = ON")  # cascade deletes fire removal triggers
+        conn.execute("BEGIN IMMEDIATE")
+        bump_revision(conn)
+        conn.executemany("DELETE FROM container WHERE id=?", [(c,) for c in targets])
+        validate_integrity(conn, quick=True)
+        conn.execute("COMMIT")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        survivors = [c for c in owned
+                     if conn.execute("SELECT 1 FROM container WHERE id=?", (c,)).fetchone()]
+    except Exception:
+        conn.execute("ROLLBACK")
+        conn.close()
+        logger.error(f"{action.capitalize()} failed (rolled back, library unchanged).")
+        return 1
+    finally:
+        conn.close()
+
+    manifest.setdefault("roots", {})[str(music_root)] = sorted(survivors)
+    save_manifest(manifest)
+    print(f"Removed {len(owned) - len(survivors)} crate(s) from root.sqlite. "
+          "Quit-and-relaunch Serato; it will reconcile.")
     return 0
