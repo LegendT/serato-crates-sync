@@ -363,3 +363,20 @@ def test_run_sync_clean_error_on_non_serato_db(tmp_path, music_tree, monkeypatch
     monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: tmp_path)
     monkeypatch.setattr(serato_db, "is_serato_running", lambda: False)
     assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=False) == 1
+
+
+def test_mirror_dry_run_counts_without_writing(root_db, music_tree):
+    """Count-only preview: accurate counts, zero rows written."""
+    conn = _connect(root_db)
+    anchors = serato_db.discover_anchors(conn)
+    index = serato_db.build_asset_index(conn, anchors.space_id)
+    tree = build_crate_tree(music_tree, DEFAULT_AUDIO_EXTENSIONS)
+    res = serato_db.mirror_tree(conn, tree, anchors, index, revision=0,
+                                owned_container_ids=set(), dry_run=True)
+    assert res.crates_created == 4
+    assert res.assets_created == 3
+    assert res.tracks_added == 3
+    # nothing written
+    assert conn.execute("SELECT count(*) FROM container WHERE name='House'").fetchone()[0] == 0
+    assert conn.execute("SELECT count(*) FROM asset").fetchone()[0] == 0
+    conn.close()

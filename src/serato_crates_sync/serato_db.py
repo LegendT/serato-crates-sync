@@ -245,13 +245,21 @@ class _IdAllocator:
 
 
 def _ensure_space_asset(
-    conn, path, *, revision, space_id, asset_index, ids, now, result,
+    conn, path, *, revision, space_id, asset_index, ids, now, result, dry_run,
 ):
-    """Return a ``space_asset.id`` for ``path``, creating asset rows if needed."""
+    """Return a ``space_asset.id`` for ``path``, creating asset rows if needed.
+
+    In ``dry_run`` mode nothing is inserted: a new track is counted and recorded
+    in ``asset_index`` with a ``None`` sentinel (so it isn't recounted), and
+    ``None`` is returned (a not-yet-existing membership).
+    """
     pid = to_portable_id(path)
-    existing = asset_index.get(pid)
-    if existing is not None:
-        return existing
+    if pid in asset_index:
+        return asset_index[pid]  # real space_asset id, or None sentinel (counted)
+    result.assets_created += 1
+    if dry_run:
+        asset_index[pid] = None
+        return None
     asset_id = ids.take("asset")
     try:
         size = path.stat().st_size
@@ -269,7 +277,6 @@ def _ensure_space_asset(
         (sa_id, asset_id, space_id),
     )
     asset_index[pid] = sa_id
-    result.assets_created += 1
     return sa_id
 
 
@@ -283,14 +290,21 @@ def mirror_tree(
     owned_container_ids: set[int],
     now: int | None = None,
     top_level: bool = False,
+    dry_run: bool = False,
 ) -> SyncResult:
     """Insert/extend crates mirroring ``tree`` under the Serato Library root.
 
-    Additive and idempotent. Assumes ``conn`` is inside a transaction and the
-    revision has already been bumped. A crate that already exists under its
-    parent is reused only if it is in ``owned_container_ids`` (ours); a
-    same-named crate we did not create is left untouched (and its subtree is
-    not recursed into — recorded in ``result.skipped_foreign_names``).
+    Additive and idempotent. For a write (``dry_run=False``) assumes ``conn`` is
+    inside a transaction and the revision has already been bumped. A crate that
+    already exists under its parent is reused only if it is in
+    ``owned_container_ids`` (ours); a same-named crate we did not create is left
+    untouched (subtree not recursed into — recorded in
+    ``result.skipped_foreign_names``).
+
+    ``dry_run=True`` computes the same counts without inserting (read-only
+    connection is fine): would-be-created crates get synthetic ids and their
+    descendants are known-new, so no per-row existence/membership queries run
+    under a fresh branch — making a full-library preview fast.
 
     ``top_level``: when True the music-root folder is not wrapped — its
     children become top-level crates under the Serato Library root, and any
@@ -303,10 +317,10 @@ def mirror_tree(
         now = int(time.time())
     ids = _IdAllocator(conn, ["container", "container_asset", "asset", "space_asset"])
 
-    # In-memory caches replace per-row SELECTs (C3)
     next_child_lo: dict[int, int] = {}   # parent container id -> last child list_order
     next_track_lo: dict[int, int] = {}   # container id -> last track list_order
     members: dict[int, set[int]] = {}    # container id -> set(space_asset_id)
+    synthetic = [-1]                     # dry-run ids for would-be-created crates
 
     def child_lo(parent_id: int) -> int:
         if parent_id not in next_child_lo:
@@ -335,11 +349,13 @@ def mirror_tree(
             }
         return members[container_id]
 
-    def walk(plan: CratePlan, parent_id: int) -> None:
-        existing = conn.execute(
+    def walk(plan: CratePlan, parent_id: int, parent_is_new: bool) -> None:
+        # A child of a brand-new crate cannot already exist — skip the lookup.
+        existing = None if parent_is_new else conn.execute(
             "SELECT id FROM container WHERE parent_id=? AND name=? COLLATE NOCASE AND type=1",
             (parent_id, plan.name),
         ).fetchone()
+
         if existing is not None:
             cid = existing[0]
             if cid not in owned_container_ids:
@@ -351,48 +367,55 @@ def mirror_tree(
                 result.skipped_foreign_names.append(plan.name)
                 return
             result.crates_reused += 1
+            is_new = False
         else:
-            cid = ids.take("container")
-            conn.execute(
-                "INSERT INTO container (id,revision,parent_id,name,type,list_order,"
-                "space_id,time_added,expanded,portable_id,color) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (cid, revision, parent_id, plan.name, 1, child_lo(parent_id),
-                 anchors.space_id, now, 0, "", None),
-            )
-            owned_container_ids.add(cid)
-            result.created_container_ids.append(cid)
             result.crates_created += 1
+            is_new = True
+            if dry_run:
+                cid = synthetic[0]
+                synthetic[0] -= 1
+            else:
+                cid = ids.take("container")
+                conn.execute(
+                    "INSERT INTO container (id,revision,parent_id,name,type,list_order,"
+                    "space_id,time_added,expanded,portable_id,color) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (cid, revision, parent_id, plan.name, 1, child_lo(parent_id),
+                     anchors.space_id, now, 0, "", None),
+                )
+                owned_container_ids.add(cid)
+                result.created_container_ids.append(cid)
 
-        seen = members_of(cid)
+        seen = set() if is_new else members_of(cid)
         for track in plan.tracks:
             sa_id = _ensure_space_asset(
                 conn, track, revision=revision, space_id=anchors.space_id,
-                asset_index=asset_index, ids=ids, now=now, result=result,
+                asset_index=asset_index, ids=ids, now=now, result=result, dry_run=dry_run,
             )
-            if sa_id in seen:
+            if sa_id is not None and sa_id in seen:
                 result.tracks_already_present += 1
                 continue
-            caid = ids.take("container_asset")
-            conn.execute(
-                "INSERT INTO container_asset (id,revision,container_id,space_asset_id,"
-                "list_order,time_added) VALUES (?,?,?,?,?,?)",
-                (caid, revision, cid, sa_id, track_lo(cid), now),
-            )
-            seen.add(sa_id)
             result.tracks_added += 1
+            if not dry_run:
+                caid = ids.take("container_asset")
+                conn.execute(
+                    "INSERT INTO container_asset (id,revision,container_id,space_asset_id,"
+                    "list_order,time_added) VALUES (?,?,?,?,?,?)",
+                    (caid, revision, cid, sa_id, track_lo(cid), now),
+                )
+                seen.add(sa_id)
 
         for child in plan.children:
-            walk(child, cid)
+            walk(child, cid, is_new)
 
     if top_level:
         for child in tree.children:
-            walk(child, anchors.root_container_id)
+            walk(child, anchors.root_container_id, False)
         if tree.tracks:  # loose tracks in the root get a crate named after it
             walk(CratePlan(name=tree.name, path=tree.path, parent_name=None,
-                           tracks=tree.tracks), anchors.root_container_id)
+                           tracks=tree.tracks), anchors.root_container_id, False)
     else:
-        walk(tree, anchors.root_container_id)
+        walk(tree, anchors.root_container_id, False)
     return result
 
 
@@ -538,11 +561,22 @@ def run_sync(
         logger.warning(f"No audio files found under {music_root} — nothing to sync.")
         return 0
 
-    # Preview pass: writes nothing, gives accurate counts for the report/confirm.
-    # (At full scale this is one pass; an --apply additionally re-runs the
-    # write pass below. A count-only preview is a future optimisation — see C3.)
+    # Preview: a read-only count-only pass (no inserts, no rollback) — fast even
+    # at full-library scale, and accurate for the report/confirm.
     try:
-        result = _sync_pass(root_db, tree, music_root, top_level=top_level, commit=False)
+        ro = sqlite3.connect(f"{root_db.as_uri()}?mode=ro", uri=True, timeout=60)
+        try:
+            ro.execute("PRAGMA busy_timeout=5000")  # coexist if Serato is open
+            assert_serato_4x_schema(ro)
+            anchors = discover_anchors(ro)
+            index = build_asset_index(ro, anchors.space_id)
+            owned = owned_ids_for(load_manifest(), music_root)
+            result = mirror_tree(
+                ro, tree, anchors, index, revision=0,
+                owned_container_ids=set(owned), top_level=top_level, dry_run=True,
+            )
+        finally:
+            ro.close()
     except (ValueError, sqlite3.Error) as e:
         logger.error(f"Sync failed: {e}")
         return 1
