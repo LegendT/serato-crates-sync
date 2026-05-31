@@ -61,11 +61,22 @@ CREATE TABLE container_asset (
     FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE,
     FOREIGN KEY(space_asset_id) REFERENCES space_asset(id) ON DELETE CASCADE
 );
--- the real revision-maintenance trigger (proves we bump serato before inserts)
+-- Real revision-maintenance + cleanup triggers (verbatim from root.sqlite),
+-- so the fixture exercises Serato's actual trigger behaviour (C2).
 CREATE TRIGGER track_space_changes_when_container_added AFTER INSERT ON container
 BEGIN
     UPDATE space SET revision=(SELECT revision FROM serato)
     WHERE space.id=new.space_id AND space.revision < (SELECT revision FROM serato);
+END;
+CREATE TRIGGER track_space_changes_when_asset_inserted AFTER INSERT ON space_asset
+BEGIN
+    UPDATE space SET revision=(SELECT revision FROM serato)
+    WHERE space.id=new.space_id AND space.revision < (SELECT revision FROM serato);
+END;
+CREATE TRIGGER after_space_asset_delete AFTER DELETE ON space_asset
+BEGIN
+    DELETE FROM asset WHERE asset.id=old.asset_id
+        AND NOT EXISTS (SELECT 1 FROM space_asset WHERE asset_id=old.asset_id);
 END;
 """
 
@@ -199,5 +210,85 @@ def test_foreign_crate_not_modified(root_db, music_tree):
                                 owned_container_ids=set(), now=1)
     # the user's DJ crate is skipped (we don't own it); nothing nested under it
     assert res.crates_skipped_foreign == 1
+    assert res.skipped_foreign_names == ["DJ"]  # C4: reported
     assert conn.execute("SELECT count(*) FROM container_asset WHERE container_id=50").fetchone()[0] == 0
     conn.close()
+
+
+def test_mirror_none_tree_returns_empty(root_db):
+    """C6: an empty music root (build_crate_tree -> None) must not crash."""
+    conn = _connect(root_db)
+    anchors = serato_db.discover_anchors(conn)
+    res = serato_db.mirror_tree(conn, None, anchors, {}, revision=101,
+                                owned_container_ids=set())
+    assert res.crates_created == 0 and res.tracks_added == 0
+    conn.close()
+
+
+def test_top_level_promotes_children(root_db, music_tree):
+    """C8: top_level=True puts the root's folders at top level, no wrapper crate."""
+    conn = _connect(root_db)
+    anchors = serato_db.discover_anchors(conn)
+    index = serato_db.build_asset_index(conn, anchors.space_id)
+    rev = serato_db.bump_revision(conn)
+    tree = build_crate_tree(music_tree, DEFAULT_AUDIO_EXTENSIONS)
+    serato_db.mirror_tree(conn, tree, anchors, index, revision=rev,
+                          owned_container_ids=set(), now=1, top_level=True)
+    # no 'DJ' wrapper; House + Techno sit directly under the library root
+    assert conn.execute("SELECT count(*) FROM container WHERE name='DJ'").fetchone()[0] == 0
+    house_parent = conn.execute("SELECT parent_id FROM container WHERE name='House'").fetchone()[0]
+    techno_parent = conn.execute("SELECT parent_id FROM container WHERE name='Techno'").fetchone()[0]
+    assert house_parent == anchors.root_container_id
+    assert techno_parent == anchors.root_container_id
+    conn.close()
+
+
+def test_asset_insert_bumps_space_revision_via_real_trigger(root_db, music_tree):
+    """C2: creating assets advances space.revision through Serato's own trigger."""
+    conn = _connect(root_db)
+    anchors = serato_db.discover_anchors(conn)
+    index = serato_db.build_asset_index(conn, anchors.space_id)
+    rev = serato_db.bump_revision(conn)
+    tree = build_crate_tree(music_tree, DEFAULT_AUDIO_EXTENSIONS)
+    serato_db.mirror_tree(conn, tree, anchors, index, revision=rev,
+                          owned_container_ids=set(), now=1)
+    # the space_asset-insert trigger (not our code) moved space.revision to rev
+    assert conn.execute("SELECT revision FROM space WHERE id=2").fetchone()[0] == rev
+    conn.close()
+
+
+def test_validate_integrity_quick_and_full(root_db):
+    conn = _connect(root_db)
+    serato_db.validate_integrity(conn, quick=True)
+    serato_db.validate_integrity(conn, quick=False)
+    conn.close()
+
+
+def test_id_allocator_honours_sqlite_sequence():
+    """C7: allocator must not reuse an id reserved by sqlite_sequence."""
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)")
+    conn.execute("INSERT INTO t (v) VALUES ('a'), ('b'), ('c')")  # seq -> 3
+    conn.execute("DELETE FROM t WHERE id=3")                       # max(id)=2, seq still 3
+    alloc = serato_db._IdAllocator(conn, ["t"])
+    assert alloc.take("t") == 4  # not 3 (which sqlite_sequence still reserves)
+    conn.close()
+
+
+def test_to_portable_id_strips_leading_slash(tmp_path):
+    """C1: portable_id is volume-relative (no leading slash); resolve() is stable."""
+    f = tmp_path / "a b.mp3"
+    f.write_bytes(b"x")
+    pid = serato_db.to_portable_id(f)
+    assert not pid.startswith("/")
+    assert pid.endswith("a b.mp3")
+    assert pid == serato_db.to_portable_id(f)  # deterministic
+
+
+def test_merge_manifest_merges_without_overwriting():
+    """C9: re-runs merge new container ids, never clobber prior ones."""
+    m = {"version": 1, "roots": {"/music": [1, 2]}}
+    serato_db.merge_manifest(m, "/music", [2, 3])
+    assert m["roots"]["/music"] == [1, 2, 3]
+    assert serato_db.owned_ids_for(m, "/music") == {1, 2, 3}
+    assert serato_db.owned_ids_for(m, "/other") == set()

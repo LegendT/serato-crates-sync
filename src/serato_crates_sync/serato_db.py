@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .library import get_default_serato_library_path, logger
+from .sync import CratePlan
 
 __all__ = [
     "REQUIRED_TABLES",
@@ -39,6 +40,8 @@ __all__ = [
     "to_portable_id",
     "load_manifest",
     "save_manifest",
+    "merge_manifest",
+    "owned_ids_for",
     "bump_revision",
     "validate_integrity",
     "mirror_tree",
@@ -72,6 +75,7 @@ class SyncResult:
     tracks_added: int = 0
     tracks_already_present: int = 0
     created_container_ids: list[int] = field(default_factory=list)
+    skipped_foreign_names: list[str] = field(default_factory=list)  # C4: visibility
 
 
 # --- Locations -------------------------------------------------------------
@@ -94,10 +98,7 @@ def is_serato_4x() -> bool:
 # --- Schema / anchors ------------------------------------------------------
 
 def assert_serato_4x_schema(conn: sqlite3.Connection) -> None:
-    """Raise if the DB is not a recognisable Serato 4.x library.
-
-    Guards against writing into an unexpected schema shape.
-    """
+    """Raise if the DB is not a recognisable Serato 4.x library."""
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     missing = REQUIRED_TABLES - names
     if missing:
@@ -136,7 +137,13 @@ def build_asset_index(conn: sqlite3.Connection, space_id: int) -> dict[str, int]
 
 
 def to_portable_id(path: Path) -> str:
-    """Serato stores local paths volume-relative, without the leading slash."""
+    """Serato stores local paths volume-relative, without the leading slash.
+
+    Uses ``resolve()`` so the string matches the canonical path Serato records
+    when it indexes the file (validated against real assets in the POC). Note:
+    on symlinked or case-variant paths the resolved form may differ from how a
+    given DJ references the file — see the symlink guard test in test_serato_db.
+    """
     return str(path.resolve()).lstrip("/")
 
 
@@ -160,6 +167,20 @@ def save_manifest(manifest: dict) -> None:
     p.write_text(json.dumps(manifest, indent=2))
 
 
+def merge_manifest(manifest: dict, music_root, new_ids) -> dict:
+    """Merge newly-created container ids into the manifest (C9: never overwrite)."""
+    roots = manifest.setdefault("roots", {})
+    key = str(music_root)
+    merged = sorted(set(roots.get(key, [])) | set(new_ids))
+    roots[key] = merged
+    return manifest
+
+
+def owned_ids_for(manifest: dict, music_root) -> set[int]:
+    """The container ids the tool previously created for this music root."""
+    return set(manifest.get("roots", {}).get(str(music_root), []))
+
+
 # --- Write helpers ---------------------------------------------------------
 
 def bump_revision(conn: sqlite3.Connection) -> int:
@@ -175,24 +196,37 @@ def bump_revision(conn: sqlite3.Connection) -> int:
     return new
 
 
-def validate_integrity(conn: sqlite3.Connection) -> None:
-    """Raise if foreign-key or integrity checks fail after a write."""
+def validate_integrity(conn: sqlite3.Connection, *, quick: bool = True) -> None:
+    """Raise if foreign-key or integrity checks fail after a write.
+
+    ``quick`` runs ``PRAGMA quick_check`` (fast, suitable as a routine guard on
+    a large live DB, C5); set ``quick=False`` for a full ``integrity_check``.
+    """
     fk = conn.execute("PRAGMA foreign_key_check").fetchall()
     if fk:
         raise sqlite3.IntegrityError(f"foreign_key_check failed: {fk[:5]}")
-    integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if integ != "ok":
-        raise sqlite3.IntegrityError(f"integrity_check failed: {integ}")
+    check = "quick_check" if quick else "integrity_check"
+    result = conn.execute(f"PRAGMA {check}").fetchone()[0]
+    if result != "ok":
+        raise sqlite3.IntegrityError(f"{check} failed: {result}")
 
 
 class _IdAllocator:
-    """Hands out fresh primary keys without a round-trip per insert."""
+    """Hands out fresh primary keys without a round-trip per insert.
+
+    Honours ``sqlite_sequence`` so AUTOINCREMENT tables never reuse an id that
+    Serato may still reference by revision (C7).
+    """
 
     def __init__(self, conn: sqlite3.Connection, tables: list[str]):
+        try:
+            seq = {r[0]: r[1] for r in conn.execute("SELECT name, seq FROM sqlite_sequence")}
+        except sqlite3.OperationalError:
+            seq = {}  # no AUTOINCREMENT table in this DB → no sqlite_sequence
         self._next = {}
         for t in tables:
             mx = conn.execute(f"SELECT max(id) FROM {t}").fetchone()[0] or 0
-            self._next[t] = mx + 1
+            self._next[t] = max(mx, seq.get(t, 0)) + 1
 
     def take(self, table: str) -> int:
         v = self._next[table]
@@ -201,22 +235,13 @@ class _IdAllocator:
 
 
 def _ensure_space_asset(
-    conn: sqlite3.Connection,
-    path: Path,
-    *,
-    revision: int,
-    space_id: int,
-    asset_index: dict[str, int],
-    ids: _IdAllocator,
-    now: int,
-    result: SyncResult,
-) -> int:
+    conn, path, *, revision, space_id, asset_index, ids, now, result,
+):
     """Return a ``space_asset.id`` for ``path``, creating asset rows if needed."""
     pid = to_portable_id(path)
     existing = asset_index.get(pid)
     if existing is not None:
         return existing
-
     asset_id = ids.take("asset")
     try:
         size = path.stat().st_size
@@ -238,91 +263,124 @@ def _ensure_space_asset(
     return sa_id
 
 
-def _find_child_container(
-    conn: sqlite3.Connection, parent_id: int, name: str
-) -> int | None:
-    row = conn.execute(
-        "SELECT id FROM container WHERE parent_id=? AND name=? COLLATE NOCASE AND type=1",
-        (parent_id, name),
-    ).fetchone()
-    return row[0] if row else None
-
-
 def mirror_tree(
     conn: sqlite3.Connection,
-    tree,  # CratePlan (folder hierarchy from sync.build_crate_tree)
+    tree,  # CratePlan (folder hierarchy from sync.build_crate_tree), or None
     anchors: Anchors,
     asset_index: dict[str, int],
     *,
     revision: int,
     owned_container_ids: set[int],
     now: int | None = None,
+    top_level: bool = False,
 ) -> SyncResult:
     """Insert/extend crates mirroring ``tree`` under the Serato Library root.
 
     Additive and idempotent. Assumes ``conn`` is inside a transaction and the
     revision has already been bumped. A crate that already exists under its
     parent is reused only if it is in ``owned_container_ids`` (ours); a
-    same-named crate we did not create is left untouched.
+    same-named crate we did not create is left untouched (and its subtree is
+    not recursed into — recorded in ``result.skipped_foreign_names``).
+
+    ``top_level``: when True the music-root folder is not wrapped — its
+    children become top-level crates under the Serato Library root, and any
+    tracks loose in the root go into a crate named after the root.
     """
+    result = SyncResult()
+    if tree is None:  # C6: empty music root
+        return result
     if now is None:
         now = int(time.time())
-    result = SyncResult()
     ids = _IdAllocator(conn, ["container", "container_asset", "asset", "space_asset"])
 
-    def walk(plan, parent_id: int) -> None:
-        existing = _find_child_container(conn, parent_id, plan.name)
+    # In-memory caches replace per-row SELECTs (C3)
+    next_child_lo: dict[int, int] = {}   # parent container id -> last child list_order
+    next_track_lo: dict[int, int] = {}   # container id -> last track list_order
+    members: dict[int, set[int]] = {}    # container id -> set(space_asset_id)
+
+    def child_lo(parent_id: int) -> int:
+        if parent_id not in next_child_lo:
+            next_child_lo[parent_id] = conn.execute(
+                "SELECT max(list_order) FROM container WHERE parent_id=?", (parent_id,)
+            ).fetchone()[0] or 0
+        next_child_lo[parent_id] += 1
+        return next_child_lo[parent_id]
+
+    def track_lo(container_id: int) -> int:
+        if container_id not in next_track_lo:
+            next_track_lo[container_id] = conn.execute(
+                "SELECT max(list_order) FROM container_asset WHERE container_id=?",
+                (container_id,),
+            ).fetchone()[0] or 0
+        next_track_lo[container_id] += 1
+        return next_track_lo[container_id]
+
+    def members_of(container_id: int) -> set[int]:
+        if container_id not in members:
+            members[container_id] = {
+                r[0] for r in conn.execute(
+                    "SELECT space_asset_id FROM container_asset WHERE container_id=?",
+                    (container_id,),
+                )
+            }
+        return members[container_id]
+
+    def walk(plan: CratePlan, parent_id: int) -> None:
+        existing = conn.execute(
+            "SELECT id FROM container WHERE parent_id=? AND name=? COLLATE NOCASE AND type=1",
+            (parent_id, plan.name),
+        ).fetchone()
         if existing is not None:
-            if existing not in owned_container_ids:
+            cid = existing[0]
+            if cid not in owned_container_ids:
                 logger.warning(
-                    f"Crate '{plan.name}' already exists under parent {parent_id} "
-                    "and was not created by this tool — skipping (not modified)."
+                    f"Crate '{plan.name}' under parent {parent_id} exists and is not "
+                    "ours — skipping it and its subtree (not modified)."
                 )
                 result.crates_skipped_foreign += 1
+                result.skipped_foreign_names.append(plan.name)
                 return
-            cid = existing
             result.crates_reused += 1
         else:
             cid = ids.take("container")
-            lo = (conn.execute(
-                "SELECT max(list_order) FROM container WHERE parent_id=?", (parent_id,)
-            ).fetchone()[0] or 0) + 1
             conn.execute(
                 "INSERT INTO container (id,revision,parent_id,name,type,list_order,"
                 "space_id,time_added,expanded,portable_id,color) "
                 "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (cid, revision, parent_id, plan.name, 1, lo, anchors.space_id,
-                 now, 0, "", None),
+                (cid, revision, parent_id, plan.name, 1, child_lo(parent_id),
+                 anchors.space_id, now, 0, "", None),
             )
             owned_container_ids.add(cid)
             result.created_container_ids.append(cid)
             result.crates_created += 1
 
+        seen = members_of(cid)
         for track in plan.tracks:
             sa_id = _ensure_space_asset(
                 conn, track, revision=revision, space_id=anchors.space_id,
                 asset_index=asset_index, ids=ids, now=now, result=result,
             )
-            present = conn.execute(
-                "SELECT 1 FROM container_asset WHERE container_id=? AND space_asset_id=?",
-                (cid, sa_id),
-            ).fetchone()
-            if present:
+            if sa_id in seen:
                 result.tracks_already_present += 1
                 continue
             caid = ids.take("container_asset")
-            lo = (conn.execute(
-                "SELECT max(list_order) FROM container_asset WHERE container_id=?", (cid,)
-            ).fetchone()[0] or 0) + 1
             conn.execute(
                 "INSERT INTO container_asset (id,revision,container_id,space_asset_id,"
                 "list_order,time_added) VALUES (?,?,?,?,?,?)",
-                (caid, revision, cid, sa_id, lo, now),
+                (caid, revision, cid, sa_id, track_lo(cid), now),
             )
+            seen.add(sa_id)
             result.tracks_added += 1
 
         for child in plan.children:
             walk(child, cid)
 
-    walk(tree, anchors.root_container_id)
+    if top_level:
+        for child in tree.children:
+            walk(child, anchors.root_container_id)
+        if tree.tracks:  # loose tracks in the root get a crate named after it
+            walk(CratePlan(name=tree.name, path=tree.path, parent_name=None,
+                           tracks=tree.tracks), anchors.root_container_id)
+    else:
+        walk(tree, anchors.root_container_id)
     return result
