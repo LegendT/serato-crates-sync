@@ -77,7 +77,7 @@ use `diagnose` and `fix-paths` instead.
 ### Why `master.sqlite` paths drop the leading slash
 
 Serato's internal convention stores paths as e.g.
-`Users/anthonygeorge/Music/...` (no leading slash). Our `sync` writes
+`Users/you/Music/...` (no leading slash). Our `sync` writes
 crate paths in the same format so loading a track via a `.crate` file
 matches the same `asset.id` that Serato would create on its own. This
 prevents duplicate asset rows when the same file is loaded via two
