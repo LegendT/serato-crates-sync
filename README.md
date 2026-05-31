@@ -46,7 +46,7 @@ Folders become crates, subfolders become subcrates with a `%%`
 delimiter (`House%%Deep.crate`).
 
 A `./sync.sh` wrapper is also included for the common case (defaults
-to `~/Music/DJ`, activates the venv, passes flags through). See
+to `~/Music/_DJ MUSIC`, activates the venv, passes flags through). See
 [docs/usage.md](docs/usage.md#sync) for details.
 
 ### Audit library health (read-only)
@@ -69,6 +69,41 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply
 
 `fix-paths --apply` snapshots `master.sqlite` before any writes and
 runs the entire repair in a single SQLite transaction.
+
+## Why folder-based crates?
+
+This tool does one thing: mirror a folder hierarchy into Serato crates.
+If your music is already organised into folders, that structure
+*becomes* your crate tree — one crate per folder, nested with `%%`.
+
+Full library managers such as [Lexicon](https://www.lexicondj.com/) can
+also export Serato crates, and they do a great deal more besides:
+cross-app conversion (rekordbox, Traktor, Engine), tag editing, smart
+playlists, duplicate detection, cloud sync. If you need that breadth,
+use one. For the narrower job of turning a curated folder tree into
+crates, a focused tool has a few advantages:
+
+- **You control the scope.** Point it at exactly the folder you want
+  (`--music-root`); it mirrors that subtree and nothing else. A
+  whole-library export can sweep in loops, stems, and project folders
+  and balloon into tens of thousands of crates — enough to leave Serato
+  slow to load, or refusing to show the crate tree at all. A scoped
+  mirror stays the size of your actual DJ library.
+- **Deterministic and reproducible.** The same folders always produce
+  the same crates. Re-run after reorganising and the crate tree follows;
+  `--clean` clears anything stale. No hidden state to drift out of sync.
+- **Local-first and free.** No account, no subscription, no cloud. Your
+  library never leaves the machine. It writes plain Serato `.crate`
+  files and only ever opens `master.sqlite` read-only.
+- **Safe by default.** Dry-run unless you pass `--apply`, and every
+  write is preceded by a timestamped backup of `Subcrates/` — a bad run
+  is one `mv` away from undone.
+- **Scriptable.** A CLI with a thin `sync.sh` wrapper drops cleanly into
+  a cron job or a post-download hook.
+
+The rule of thumb: reach for a full library manager when you need its
+breadth; reach for this when your folders are already the source of
+truth and you just want Serato to reflect them.
 
 ## Safety
 
