@@ -9,12 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Serato DJ Pro 4.x crate engine.** `sync` now detects a 4.x SQLite
+  library (`root.sqlite`) and writes it directly instead of legacy
+  `.crate` files (which 4.x ignores). It creates one crate per folder
+  (nested via `parent_id`) and imports tracks not yet in the library as
+  `asset`/`space_asset` rows; Serato aggregates the change into
+  `master.sqlite` and analyses new tracks on next launch. New module
+  `serato_db.py`.
+  - Dry-run by default with a count-only preview; `--apply` to write.
+  - Refuses to write while Serato is open; backs up `root.sqlite` and
+    `master.sqlite`; single `BEGIN IMMEDIATE` transaction with
+    integrity check and WAL checkpoint.
+  - Additive and idempotent via a manifest of tool-created crates; never
+    modifies user-made crates.
+  - `--top-level` (folders at top level instead of one wrapper crate),
+    `--yes` (skip the large-change confirmation), `--prune` (remove
+    tool-created crates whose source folder is gone), and `--clean`
+    (remove all tool-created crates for the music root). On 4.x,
+    `--prune`/`--clean` replace the 3.x `.crate` cleanup.
+- `docs/serato4-crate-engine-plan.md` documenting the design and the
+  reverse-engineered 4.x library format; `docs/internals.md` gains a
+  "Serato 4.x crate engine" section.
 - README section ("Why folder-based crates?") explaining when a
   focused folder-to-crate tool is a better fit than a full library
   manager such as Lexicon, and when it is not.
 
 ### Changed
 
+- Serato 3.x behaviour is unchanged: when no `root.sqlite` is present,
+  `sync` still writes `Subcrates/*.crate` exactly as before. The
+  `--overwrite`/`--path-mode`/`--subcrate-delimiter` options are 3.x-only
+  and warn when passed on 4.x.
 - `sync.sh` wrapper now defaults to `~/Music/_DJ MUSIC` (was
   `~/Music/DJ`). Override per-run with `MUSIC_ROOT`, or edit the
   wrapper to change it permanently.

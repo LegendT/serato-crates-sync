@@ -38,16 +38,27 @@ write-lock check alone.
 ### Generate crates from a folder hierarchy
 
 ```bash
-serato-crates sync --music-root ~/Music/DJ           # dry-run
+serato-crates sync --music-root ~/Music/DJ           # dry-run preview
 serato-crates sync --music-root ~/Music/DJ --apply   # write
 ```
 
-Folders become crates, subfolders become subcrates with a `%%`
-delimiter (`House%%Deep.crate`).
+Folders become crates and subfolders become nested subcrates, mirroring
+your tree.
 
-A `./sync.sh` wrapper is also included for the common case (defaults
-to `~/Music/_DJ MUSIC`, activates the venv, passes flags through). See
-[docs/usage.md](docs/usage.md#sync) for details.
+**On Serato DJ Pro 4.x** (a `root.sqlite` library is present) `sync`
+writes the SQLite library directly: it creates the crates and imports any
+tracks not already in your library, which Serato then analyses on next
+launch. Serato must be quit for `--apply`. Re-runs are additive and
+idempotent; `--prune` removes crates whose source folder you've deleted.
+(Serato 4.x ignores the legacy `.crate` files, so writing them has no
+effect — this is why the database route is used.)
+
+**On Serato 3.x** `sync` writes legacy `Subcrates/*.crate` files
+(subcrates as `House%%Deep.crate`), the format 3.x reads.
+
+A `./sync.sh` wrapper is included for the common case (defaults to
+`~/Music/_DJ MUSIC`, activates the venv, passes flags through). See
+[docs/usage.md](docs/usage.md#sync) for the full flag list.
 
 ### Audit library health (read-only)
 
@@ -74,7 +85,8 @@ runs the entire repair in a single SQLite transaction.
 
 This tool does one thing: mirror a folder hierarchy into Serato crates.
 If your music is already organised into folders, that structure
-*becomes* your crate tree — one crate per folder, nested with `%%`.
+*becomes* your crate tree — one crate per folder, subfolders as nested
+subcrates.
 
 Full library managers such as [Lexicon](https://www.lexicondj.com/) can
 also export Serato crates, and they do a great deal more besides:
@@ -93,11 +105,13 @@ crates, a focused tool has a few advantages:
   the same crates. Re-run after reorganising and the crate tree follows;
   `--clean` clears anything stale. No hidden state to drift out of sync.
 - **Local-first and free.** No account, no subscription, no cloud. Your
-  library never leaves the machine. It writes plain Serato `.crate`
-  files and only ever opens `master.sqlite` read-only.
-- **Safe by default.** Dry-run unless you pass `--apply`, and every
-  write is preceded by a timestamped backup of `Subcrates/` — a bad run
-  is one `mv` away from undone.
+  library never leaves the machine — the tool only ever writes your local
+  Serato library (legacy `.crate` files on 3.x; the SQLite database on
+  4.x) and nothing else.
+- **Safe by default.** Dry-run unless you pass `--apply`, and every write
+  is preceded by a timestamped backup (the `Subcrates/` folder on 3.x;
+  `root.sqlite` + `master.sqlite` on 4.x) — a bad run is one restore away
+  from undone.
 - **Scriptable.** A CLI with a thin `sync.sh` wrapper drops cleanly into
   a cron job or a post-download hook.
 

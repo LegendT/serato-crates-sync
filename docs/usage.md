@@ -14,6 +14,67 @@ crate format) see [internals.md](internals.md).
 
 ## `sync`
 
+`sync` mirrors a folder hierarchy into Serato crates. It auto-detects
+your Serato version and uses the right mechanism:
+
+- **Serato DJ Pro 4.x** (a `root.sqlite` library exists) — writes the
+  **SQLite library** directly (see below). This is the default on 4.x.
+- **Serato 3.x** — writes legacy `Subcrates/*.crate` files (the
+  `--clean` / `--overwrite` / `--path-mode` / `--subcrate-delimiter`
+  options documented further down apply to this path only).
+
+### Serato 4.x (SQLite engine)
+
+Serato 4.x reads its library from SQLite, not from `.crate` files, so
+`sync` writes `root.sqlite` directly. It creates one crate per folder
+(nested via real parent/child relationships, not `%%` filenames) and
+**creates library entries for any tracks not already in Serato** —
+Serato aggregates the change into `master.sqlite` and analyses the new
+tracks (BPM/key/waveform) on its next launch.
+
+```bash
+serato-crates sync --music-root ~/Music/DJ                 # dry-run preview (counts only)
+serato-crates sync --music-root ~/Music/DJ --apply         # write
+serato-crates sync --music-root ~/Music/DJ --apply --yes   # skip the large-change prompt
+serato-crates sync --music-root ~/Music/DJ --apply --top-level   # folders at top level (no wrapper crate)
+serato-crates sync --music-root ~/Music/DJ --apply --prune        # also remove crates whose folder is gone
+serato-crates sync --music-root ~/Music/DJ --apply --clean        # remove ALL tool-created crates for this root
+```
+
+Behaviour and safety:
+
+- **Dry-run by default**; `--apply` writes. The preview reports crates
+  to create, tracks to add, and new assets to create — without writing.
+- **Refuses to run with `--apply` while Serato is open.** Quit Serato first.
+- **Backs up `root.sqlite` and `master.sqlite`** (timestamped) before
+  writing, after checkpointing the WAL.
+- **Large changes** (creating assets, or > 500 crates) prompt for
+  confirmation unless `--yes`.
+- **Additive and idempotent.** Re-runs add only new folders/tracks and
+  reuse existing crates (tracked in a manifest at
+  `~/Library/Application Support/Serato/Library/.serato-crates-sync/`).
+  It never modifies crates you made yourself.
+- **`--prune`** removes only tool-created crates whose source folder no
+  longer exists; **`--clean`** removes every tool-created crate for the
+  music root. Both touch only crates the tool made (tracked in the
+  manifest) — never your own crates, and **never your tracks**: removing
+  a crate deletes the *grouping*, not the imported `asset` rows, so BPM /
+  key / cue-point analysis is kept and the tracks stay under **All** and
+  any other crate. (Tracks are not un-imported; remove those in Serato if
+  you want them gone.) Removal is written to **both `root.sqlite` and
+  `master.sqlite`**, and prune mirrors the layout recorded at creation.
+- **First launch after a large sync is slow** — Serato aggregates the
+  delta and begins analysing the new files (a long background job).
+
+To restore, quit Serato and copy the timestamped `.BACKUP.` files back
+over `root.sqlite` and `master.sqlite` (and delete any `-wal`/`-shm`).
+
+Each `--apply` (including `--prune`/`--clean`) leaves a fresh
+`*.BACKUP.<timestamp>` of both databases — `master.sqlite` is large
+(often >1 GB), so these accumulate. Delete the older
+`root.sqlite.BACKUP.*` / `master.sqlite.BACKUP.*` files once you're happy
+with a run to reclaim space.
+
 ### Quick start (wrapper script)
 
 A `sync.sh` wrapper is included for the common case. It activates the
