@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `docs/serato4-crate-engine-plan.md` documenting the design and the
   reverse-engineered 4.x library format; `docs/internals.md` gains a
   "Serato 4.x crate engine" section.
+- README section ("Why folder-based crates?") explaining when a
+  focused folder-to-crate tool is a better fit than a full library
+  manager such as Lexicon, and when it is not.
 
 ### Changed
 
@@ -37,6 +40,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sync` still writes `Subcrates/*.crate` exactly as before. The
   `--overwrite`/`--path-mode`/`--subcrate-delimiter` options are 3.x-only
   and warn when passed on 4.x.
+- `sync.sh` wrapper now defaults to `~/Music/_DJ MUSIC` (was
+  `~/Music/DJ`). Override per-run with `MUSIC_ROOT`, or edit the
+  wrapper to change it permanently.
 
 ## [0.3.0] — 2026-05-07
 
