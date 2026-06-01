@@ -47,6 +47,7 @@ __all__ = [
     "save_manifest",
     "merge_manifest",
     "owned_ids_for",
+    "top_level_for",
     "bump_revision",
     "validate_integrity",
     "mirror_tree",
@@ -178,18 +179,36 @@ def save_manifest(manifest: dict) -> None:
     p.write_text(json.dumps(manifest, indent=2))
 
 
-def merge_manifest(manifest: dict, music_root, new_ids) -> dict:
-    """Merge newly-created container ids into the manifest (C9: never overwrite)."""
+# A manifest root entry is {"top_level": bool, "crates": [ids]}. Older versions
+# stored a bare list of ids (implicitly top_level=False); both are read here.
+
+def _entry_crates(entry) -> list[int]:
+    if isinstance(entry, dict):
+        return list(entry.get("crates", []))
+    return list(entry or [])  # legacy bare list
+
+
+def merge_manifest(manifest: dict, music_root, new_ids, top_level: bool = False) -> dict:
+    """Merge newly-created container ids into the manifest (C9: never overwrite).
+
+    Records the ``top_level`` layout used, so prune mirrors the same shape (P2).
+    """
     roots = manifest.setdefault("roots", {})
     key = str(music_root)
-    merged = sorted(set(roots.get(key, [])) | set(new_ids))
-    roots[key] = merged
+    merged = sorted(set(_entry_crates(roots.get(key))) | set(new_ids))
+    roots[key] = {"top_level": bool(top_level), "crates": merged}
     return manifest
 
 
 def owned_ids_for(manifest: dict, music_root) -> set[int]:
     """The container ids the tool previously created for this music root."""
-    return set(manifest.get("roots", {}).get(str(music_root), []))
+    return set(_entry_crates(manifest.get("roots", {}).get(str(music_root))))
+
+
+def top_level_for(manifest: dict, music_root) -> bool:
+    """The ``top_level`` layout recorded when these crates were created (P2)."""
+    entry = manifest.get("roots", {}).get(str(music_root))
+    return bool(entry.get("top_level", False)) if isinstance(entry, dict) else False
 
 
 # --- Write helpers ---------------------------------------------------------
@@ -499,7 +518,7 @@ def _sync_pass(
         if commit:
             conn.execute("COMMIT")
             conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            merge_manifest(manifest, music_root, result.created_container_ids)
+            merge_manifest(manifest, music_root, result.created_container_ids, top_level)
             try:
                 save_manifest(manifest)
             except OSError as e:  # committed, but manifest not recorded (O7)
@@ -655,6 +674,60 @@ def _container_path(conn: sqlite3.Connection, cid: int, root_id: int):
     return tuple(reversed(names))
 
 
+def _cf_path(path_tuple: tuple) -> tuple:
+    """Case-fold a crate name-path so comparisons match the DB's NOCASE
+    uniqueness (P7)."""
+    return tuple(n.casefold() for n in path_tuple)
+
+
+def _prune_from_master(master_db: Path, removed_root_ids: list[int]) -> int:
+    """Remove the master.sqlite copies of containers deleted from root (P1).
+
+    Maps each removed root container id to its master container via
+    ``location_container.external_container_id`` and deletes it (FK cascade
+    clears master's location_container/container_asset). No-op if master has
+    not aggregated the crates yet (e.g. Serato hasn't launched since create).
+    """
+    if not master_db.exists() or not removed_root_ids:
+        return 0
+    conn = sqlite3.connect(master_db, timeout=60)
+    conn.isolation_level = None
+    try:
+        conn.execute("PRAGMA foreign_keys = ON")
+        conn.execute("BEGIN IMMEDIATE")
+        removed = 0
+        ids = list(removed_root_ids)
+        for i in range(0, len(ids), 500):  # bounded IN(...) parameter lists
+            chunk = ids[i:i + 500]
+            ph = ",".join("?" * len(chunk))
+            mcids = [r[0] for r in conn.execute(
+                f"SELECT container_id FROM location_container WHERE external_container_id IN ({ph})",
+                chunk,
+            )]
+            if mcids:
+                conn.executemany("DELETE FROM container WHERE id=?", [(c,) for c in mcids])
+                removed += len(mcids)
+        # tidy stale UI selections + transient sync-tracking tables
+        conn.execute("DELETE FROM selection_asset WHERE container_asset_id "
+                     "NOT IN (SELECT id FROM container_asset)")
+        for t in ("updated_container", "updated_smart_crate", "moved_container",
+                  "updated_container_tree", "updated_container_asset_list_columns",
+                  "removed_asset"):
+            try:
+                conn.execute(f"DELETE FROM {t}")
+            except sqlite3.OperationalError:
+                pass
+        validate_integrity(conn, quick=True)
+        conn.execute("COMMIT")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return removed
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
+
+
 def run_prune(
     music_root: Path,
     *,
@@ -669,12 +742,14 @@ def run_prune(
     ``clean=False`` (prune): remove only crates whose source folder no longer
     exists on disk. ``clean=True``: remove every crate the tool created for this
     music root. Only crates recorded in the manifest are ever touched — never
-    user-made crates. Created assets are retained (they are valid library
-    tracks). Removes from ``root.sqlite``; Serato reconciles ``master.sqlite``
-    on next launch (the same revision mechanism that propagates creates).
+    user-made crates, and **never tracks** (created assets are retained as
+    valid library entries, with their analysis). Removes from **both**
+    ``root.sqlite`` and ``master.sqlite`` so the change is complete regardless
+    of Serato's launch-time reconciliation.
     """
     action = "clean" if clean else "prune"
     root_db = get_root_db_path()
+    master_db = get_master_db_path()
     if not root_db.exists():
         logger.error(f"No Serato 4.x library found at {root_db}")
         return 1
@@ -688,6 +763,15 @@ def run_prune(
         logger.warning(f"No tool-created crates recorded for {music_root} — nothing to {action}.")
         return 0
 
+    # Prune must mirror the layout the crates were CREATED with (P2), not a
+    # flag passed now — otherwise every path mismatches and all crates look stale.
+    recorded_top_level = top_level_for(manifest, music_root)
+    if top_level != recorded_top_level:
+        logger.warning(
+            f"Ignoring --top-level={top_level}; using the layout recorded at "
+            f"creation (top_level={recorded_top_level})."
+        )
+
     try:
         ro = sqlite3.connect(f"{root_db.as_uri()}?mode=ro", uri=True, timeout=60)
         try:
@@ -698,11 +782,11 @@ def run_prune(
                 targets = [c for c in owned
                            if ro.execute("SELECT 1 FROM container WHERE id=?", (c,)).fetchone()]
             else:
-                desired = _desired_crate_paths(
-                    build_crate_tree(music_root, extensions), top_level)
+                desired = {_cf_path(p) for p in _desired_crate_paths(
+                    build_crate_tree(music_root, extensions), recorded_top_level)}
                 targets = [c for c in owned
                            if (p := _container_path(ro, c, anchors.root_container_id)) is not None
-                           and p not in desired]
+                           and _cf_path(p) not in desired]
         finally:
             ro.close()
     except (ValueError, sqlite3.Error) as e:
@@ -710,6 +794,7 @@ def run_prune(
         return 1
 
     print(f"\n{action.upper()}: {len(targets)} tool-created crate(s) to remove for {music_root}")
+    print("(crate groupings only — your tracks and their analysis stay in the library)")
     if not apply:
         print(f"DRY RUN — no changes written. Add --apply to {action}.")
         return 0
@@ -725,16 +810,16 @@ def run_prune(
             return 0
 
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for db in (root_db, get_master_db_path()):
+    for db in (root_db, master_db):
         b = _backup_db(db, ts)
         if b:
             print(f"Backup created: {b}")
 
+    # 1. Remove from root.sqlite (the authoritative store).
     conn = sqlite3.connect(root_db, timeout=60)
     conn.isolation_level = None
     try:
         conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA recursive_triggers = ON")  # cascade deletes fire removal triggers
         conn.execute("BEGIN IMMEDIATE")
         bump_revision(conn)
         conn.executemany("DELETE FROM container WHERE id=?", [(c,) for c in targets])
@@ -751,8 +836,25 @@ def run_prune(
     finally:
         conn.close()
 
-    manifest.setdefault("roots", {})[str(music_root)] = sorted(survivors)
+    removed_root_ids = sorted(set(owned) - set(survivors))
+    # Manifest reflects root (the source of truth) immediately.
+    manifest.setdefault("roots", {})[str(music_root)] = {
+        "top_level": recorded_top_level, "crates": sorted(survivors)
+    }
     save_manifest(manifest)
-    print(f"Removed {len(owned) - len(survivors)} crate(s) from root.sqlite. "
-          "Quit-and-relaunch Serato; it will reconcile.")
+
+    # 2. Remove the aggregated copies from master.sqlite (best-effort; root is
+    #    already authoritative, so a master hiccup leaves a recoverable state).
+    try:
+        _prune_from_master(master_db, removed_root_ids)
+    except (ValueError, sqlite3.Error) as e:
+        logger.error(
+            f"Removed {len(removed_root_ids)} from root.sqlite, but master.sqlite "
+            f"cleanup failed ({e}). Relaunch Serato (it reconciles from root), or "
+            f"restore the .BACKUP.{ts} files."
+        )
+        return 1
+
+    print(f"Removed {len(removed_root_ids)} crate(s) from root.sqlite and master.sqlite. "
+          "Relaunch Serato to see the change.")
     return 0

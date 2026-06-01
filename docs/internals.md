@@ -114,10 +114,15 @@ directly:
   triggers that advance `space.revision` on insert/delete; the engine
   only bumps the global `serato.revision` and stamps new rows.
 - **Idempotent re-runs + ownership.** A manifest
-  (`.serato-crates-sync/manifest.json`) records the container ids the
-  tool created, per music root. Re-runs reuse those crates and dedupe
-  memberships; `--prune` / `--clean` only ever remove manifest-recorded
-  crates, so user-made crates are never touched.
+  (`.serato-crates-sync/manifest.json`) records, per music root, the
+  container ids the tool created and the `top_level` layout used. Re-runs
+  reuse those crates and dedupe memberships; `--prune` / `--clean` only
+  ever remove manifest-recorded crates (so user-made crates are never
+  touched) and remove them from **both** `root.sqlite` and `master.sqlite`
+  (mapping via `external_container_id`) so the removal is complete without
+  depending on Serato's launch-time reconciliation. Removal deletes crate
+  *groupings* only — the imported `asset` rows (and their analysis) are
+  retained.
 - **Safety.** Dry-run by default; refuses to write while Serato is open;
   `BEGIN IMMEDIATE` + `foreign_key_check`/`quick_check` + WAL checkpoint;
   timestamped backups of both databases before any write.

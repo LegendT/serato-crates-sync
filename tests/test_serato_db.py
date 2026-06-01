@@ -288,9 +288,9 @@ def test_to_portable_id_strips_leading_slash(tmp_path):
 
 def test_merge_manifest_merges_without_overwriting():
     """C9: re-runs merge new container ids, never clobber prior ones."""
-    m = {"version": 1, "roots": {"/music": [1, 2]}}
+    m = {"version": 1, "roots": {"/music": [1, 2]}}  # legacy bare-list entry
     serato_db.merge_manifest(m, "/music", [2, 3])
-    assert m["roots"]["/music"] == [1, 2, 3]
+    assert m["roots"]["/music"]["crates"] == [1, 2, 3]  # migrated to dict, merged
     assert serato_db.owned_ids_for(m, "/music") == {1, 2, 3}
     assert serato_db.owned_ids_for(m, "/other") == set()
 
@@ -322,7 +322,7 @@ def test_run_sync_dry_run_then_apply_then_idempotent(root_db, music_tree, monkey
                               apply=True, assume_yes=True) == 0
     assert _count(root_db, "House") == 1
     manifest = json.loads(manifest_file.read_text())
-    assert len(manifest["roots"][str(music_tree)]) == 4
+    assert len(manifest["roots"][str(music_tree)]["crates"]) == 4
     assert list(root_db.parent.glob("root.sqlite.BACKUP.*"))  # O9
 
     # re-run apply: no duplicates, manifest count unchanged
@@ -330,7 +330,7 @@ def test_run_sync_dry_run_then_apply_then_idempotent(root_db, music_tree, monkey
                               apply=True, assume_yes=True) == 0
     assert _count(root_db, "House") == 1
     manifest = json.loads(manifest_file.read_text())
-    assert len(manifest["roots"][str(music_tree)]) == 4
+    assert len(manifest["roots"][str(music_tree)]["crates"]) == 4
 
 
 def test_run_sync_refuses_while_serato_running(root_db, music_tree, monkeypatch, tmp_path):
@@ -409,7 +409,7 @@ def test_run_clean_removes_all_tool_crates(root_db, music_tree, monkeypatch, tmp
     for name in ("DJ", "House", "Deep", "Techno"):
         assert _count(root_db, name) == 0
     manifest_file = root_db.parent / serato_db.MANIFEST_DIRNAME / serato_db.MANIFEST_FILENAME
-    assert json.loads(manifest_file.read_text())["roots"][str(music_tree)] == []
+    assert json.loads(manifest_file.read_text())["roots"][str(music_tree)]["crates"] == []
 
 
 def test_run_prune_dry_run_writes_nothing(root_db, music_tree, monkeypatch, tmp_path):
@@ -436,3 +436,56 @@ def test_run_prune_leaves_user_crate(root_db, music_tree, monkeypatch, tmp_path)
     serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
                         clean=True, apply=True, assume_yes=True)
     assert _count(root_db, "MyCrate") == 1  # untouched
+
+
+MASTER_SCHEMA = """
+CREATE TABLE container (id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE location_container (
+    id INTEGER PRIMARY KEY, container_id INTEGER NOT NULL, location_id INTEGER,
+    external_container_id INTEGER,
+    FOREIGN KEY(container_id) REFERENCES container(id) ON DELETE CASCADE);
+CREATE TABLE container_asset (
+    id INTEGER PRIMARY KEY, location_container_id INTEGER NOT NULL, space_asset_id INTEGER,
+    FOREIGN KEY(location_container_id) REFERENCES location_container(id) ON DELETE CASCADE);
+CREATE TABLE selection_asset (id INTEGER PRIMARY KEY, container_asset_id INTEGER, asset_id INTEGER);
+"""
+
+
+def test_prune_from_master_removes_by_external_id(tmp_path):
+    """P1/P5: master copies are removed by mapping root id -> external_container_id."""
+    db = tmp_path / "master.sqlite"
+    c = sqlite3.connect(db)
+    c.executescript(MASTER_SCHEMA)
+    # master crate 100 mirrors root crate 74841 (to remove); 200 mirrors 99999 (keep)
+    c.execute("INSERT INTO container (id,name) VALUES (100,'X'),(200,'Y')")
+    c.execute("INSERT INTO location_container (id,container_id,location_id,external_container_id) "
+              "VALUES (1,100,1,74841),(2,200,1,99999)")
+    c.execute("INSERT INTO container_asset (id,location_container_id,space_asset_id) "
+              "VALUES (10,1,5),(11,2,6)")
+    c.execute("INSERT INTO selection_asset (id,container_asset_id,asset_id) VALUES (1,10,5)")
+    c.commit()
+    c.close()
+
+    assert serato_db._prune_from_master(db, [74841]) == 1
+    c = sqlite3.connect(db)
+    assert c.execute("SELECT count(*) FROM container WHERE id=100").fetchone()[0] == 0
+    assert c.execute("SELECT count(*) FROM container WHERE id=200").fetchone()[0] == 1   # kept
+    assert c.execute("SELECT count(*) FROM container_asset WHERE id=10").fetchone()[0] == 0  # cascaded
+    assert c.execute("SELECT count(*) FROM selection_asset").fetchone()[0] == 0            # orphan cleaned
+    c.close()
+
+
+def test_prune_from_master_noop_when_absent(tmp_path):
+    assert serato_db._prune_from_master(tmp_path / "nope.sqlite", [1, 2, 3]) == 0
+
+
+def test_manifest_records_and_reads_top_level():
+    """P2: manifest stores the layout; legacy bare-list reads as top_level=False."""
+    m = {"version": 1, "roots": {}}
+    serato_db.merge_manifest(m, "/x", [1, 2], top_level=True)
+    serato_db.merge_manifest(m, "/x", [2, 3], top_level=True)  # merge, not clobber
+    assert serato_db.owned_ids_for(m, "/x") == {1, 2, 3}
+    assert serato_db.top_level_for(m, "/x") is True
+    m["roots"]["/legacy"] = [7, 8]  # old bare-list format
+    assert serato_db.owned_ids_for(m, "/legacy") == {7, 8}
+    assert serato_db.top_level_for(m, "/legacy") is False

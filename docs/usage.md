@@ -56,9 +56,13 @@ Behaviour and safety:
   It never modifies crates you made yourself.
 - **`--prune`** removes only tool-created crates whose source folder no
   longer exists; **`--clean`** removes every tool-created crate for the
-  music root. Both leave your own crates and your tracks intact (created
-  assets are retained as valid library entries). Removal is written to
-  `root.sqlite`; Serato reconciles `master.sqlite` on next launch.
+  music root. Both touch only crates the tool made (tracked in the
+  manifest) — never your own crates, and **never your tracks**: removing
+  a crate deletes the *grouping*, not the imported `asset` rows, so BPM /
+  key / cue-point analysis is kept and the tracks stay under **All** and
+  any other crate. (Tracks are not un-imported; remove those in Serato if
+  you want them gone.) Removal is written to **both `root.sqlite` and
+  `master.sqlite`**, and prune mirrors the layout recorded at creation.
 - **First launch after a large sync is slow** — Serato aggregates the
   delta and begins analysing the new files (a long background job).
 
