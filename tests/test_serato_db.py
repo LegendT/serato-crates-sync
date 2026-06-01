@@ -489,3 +489,40 @@ def test_manifest_records_and_reads_top_level():
     m["roots"]["/legacy"] = [7, 8]  # old bare-list format
     assert serato_db.owned_ids_for(m, "/legacy") == {7, 8}
     assert serato_db.top_level_for(m, "/legacy") is False
+
+
+def test_run_prune_cleans_both_databases(root_db, music_tree, monkeypatch, tmp_path):
+    """Q3: run_prune(clean) removes crates from root.sqlite AND master.sqlite."""
+    master = tmp_path / "master.sqlite"
+    mc = sqlite3.connect(master)
+    mc.executescript(MASTER_SCHEMA)
+    mc.commit()
+    mc.close()
+    _setup_live(root_db, tmp_path, monkeypatch)  # get_master_db_path -> tmp_path/master.sqlite
+
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    owned = serato_db.owned_ids_for(serato_db.load_manifest(), music_tree)
+    # build the master "aggregate": one master container per created root crate
+    mc = sqlite3.connect(master)
+    for i, root_cid in enumerate(sorted(owned), start=1):
+        mc.execute("INSERT INTO container (id,name) VALUES (?,?)", (1000 + i, f"c{i}"))
+        mc.execute("INSERT INTO location_container (id,container_id,location_id,external_container_id) "
+                   "VALUES (?,?,1,?)", (i, 1000 + i, root_cid))
+    mc.commit()
+    mc.close()
+
+    assert serato_db.run_prune(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                               clean=True, apply=True, assume_yes=True) == 0
+    assert _count(root_db, "DJ") == 0  # root cleaned
+    mc = sqlite3.connect(master)
+    assert mc.execute("SELECT count(*) FROM container").fetchone()[0] == 0  # master copies cleaned
+    mc.close()
+
+
+def test_run_sync_refuses_layout_change(root_db, music_tree, monkeypatch, tmp_path):
+    """Q2: re-syncing a root with a different --top-level is refused."""
+    _setup_live(root_db, tmp_path, monkeypatch)
+    serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS, apply=True, assume_yes=True)
+    # created with top_level=False; requesting top_level=True must be refused
+    assert serato_db.run_sync(music_tree, extensions=DEFAULT_AUDIO_EXTENSIONS,
+                              apply=True, assume_yes=True, top_level=True) == 1

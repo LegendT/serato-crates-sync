@@ -69,6 +69,12 @@ Behaviour and safety:
 To restore, quit Serato and copy the timestamped `.BACKUP.` files back
 over `root.sqlite` and `master.sqlite` (and delete any `-wal`/`-shm`).
 
+Each `--apply` (including `--prune`/`--clean`) leaves a fresh
+`*.BACKUP.<timestamp>` of both databases — `master.sqlite` is large
+(often >1 GB), so these accumulate. Delete the older
+`root.sqlite.BACKUP.*` / `master.sqlite.BACKUP.*` files once you're happy
+with a run to reclaim space.
+
 ### Quick start (wrapper script)
 
 A `sync.sh` wrapper is included for the common case. It activates the

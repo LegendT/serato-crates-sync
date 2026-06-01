@@ -581,6 +581,19 @@ def run_sync(
         logger.warning(f"No audio files found under {music_root} — nothing to sync.")
         return 0
 
+    # Refuse to mix layouts for one music root (Q2): if crates already exist for
+    # it under a different top_level, the manifest would flip and later mis-target
+    # prune. Switch deliberately via --clean, not by silently re-syncing.
+    _manifest = load_manifest()
+    if owned_ids_for(_manifest, music_root) and top_level_for(_manifest, music_root) != top_level:
+        logger.error(
+            f"Crates for {music_root} were created with top_level="
+            f"{top_level_for(_manifest, music_root)}, but --top-level={top_level} was "
+            "requested. Mixing layouts for one music root is unsupported — re-run with "
+            "the original layout, or `--clean` first to switch."
+        )
+        return 1
+
     # Preview: a read-only count-only pass (no inserts, no rollback) — fast even
     # at full-library scale, and accurate for the report/confirm.
     try:
@@ -707,7 +720,8 @@ def _prune_from_master(master_db: Path, removed_root_ids: list[int]) -> int:
             if mcids:
                 conn.executemany("DELETE FROM container WHERE id=?", [(c,) for c in mcids])
                 removed += len(mcids)
-        # tidy stale UI selections + transient sync-tracking tables
+        # tidy stale UI selections + wholesale-clear the transient sync-tracking
+        # tables (safe: Serato is quit, so these hold no live session state)
         conn.execute("DELETE FROM selection_asset WHERE container_asset_id "
                      "NOT IN (SELECT id FROM container_asset)")
         for t in ("updated_container", "updated_smart_crate", "moved_container",
@@ -849,9 +863,9 @@ def run_prune(
         _prune_from_master(master_db, removed_root_ids)
     except (ValueError, sqlite3.Error) as e:
         logger.error(
-            f"Removed {len(removed_root_ids)} from root.sqlite, but master.sqlite "
-            f"cleanup failed ({e}). Relaunch Serato (it reconciles from root), or "
-            f"restore the .BACKUP.{ts} files."
+            f"Removed {len(removed_root_ids)} crate(s) from root.sqlite, but the "
+            f"master.sqlite cleanup failed ({e}). To return to a known-good state, "
+            f"quit Serato and restore BOTH .BACKUP.{ts} files (root + master)."
         )
         return 1
 
