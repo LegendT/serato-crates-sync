@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- README section ("Why folder-based crates?") explaining when a
+  focused folder-to-crate tool is a better fit than a full library
+  manager such as Lexicon, and when it is not.
+
+### Changed
+
+- `sync.sh` wrapper now defaults to `~/Music/_DJ MUSIC` (was
+  `~/Music/DJ`). Override per-run with `MUSIC_ROOT`, or edit the
+  wrapper to change it permanently.
+
 ## [0.3.0] — 2026-05-07
 
 ### Added

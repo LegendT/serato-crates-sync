@@ -26,7 +26,7 @@ venv and passes through any flags:
 ./sync.sh --apply --verbose
 ```
 
-The script defaults to `$HOME/Music/DJ`. Override per-run with
+The script defaults to `$HOME/Music/_DJ MUSIC`. Override per-run with
 `MUSIC_ROOT`:
 
 ```bash
