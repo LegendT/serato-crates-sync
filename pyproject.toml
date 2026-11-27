@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "serato-crates-sync"
-version = "0.3.0"
+dynamic = ["version"]   # read from src/serato_crates_sync/__init__.py, the one place it is set
 description = "Generate Serato DJ Pro crates, audit library health, and repair broken asset paths"
 readme = "README.md"
 license = {text = "MIT"}
@@ -28,13 +28,13 @@ classifiers = [
 ]
 dependencies = [
     "serato-crate>=0.0.1,<1.0",
-    "typing_extensions>=4.0.0,<5",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
+    "ruff>=0.4",
 ]
 
 [project.scripts]
@@ -42,6 +42,9 @@ serato-crates = "serato_crates_sync.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "serato_crates_sync.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -19,7 +19,6 @@ __all__ = [
     "get_default_serato_root",
     "get_subcrates_folder",
     "get_default_serato_library_path",
-    "get_serato_cache_folder",
     "connect_serato_library_readonly",
     "is_serato_running",
     "validate_music_root",
@@ -48,38 +47,35 @@ def get_subcrates_folder(serato_root: Path) -> Path:
 
 
 def get_default_serato_library_path() -> Path:
-    """Get the default Serato master.sqlite path for the current platform."""
-    if sys.platform == "darwin":
-        return (
-            Path.home()
-            / "Library" / "Application Support" / "Serato" / "Library" / "master.sqlite"
-        )
-    elif sys.platform == "win32":
+    """Get the default Serato master.sqlite path.
+
+    The macOS path is measured. The Windows path is not. Serato has no build
+    for any other platform: there the macOS layout is returned so that the help
+    text has a default to show, and ``--library-path`` is needed.
+    """
+    if sys.platform == "win32":
         return (
             Path(os.environ.get("LOCALAPPDATA", ""))
             / "Serato" / "Library" / "master.sqlite"
         )
-    else:
-        return Path.home() / ".serato" / "Library" / "master.sqlite"
-
-
-def get_serato_cache_folder() -> Path:
-    """Get the Serato application cache folder for the current platform."""
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "Serato"
-    elif sys.platform == "win32":
-        return Path(os.environ.get("LOCALAPPDATA", "")) / "Serato"
-    else:
-        return Path.home() / ".serato"
+    return (
+        Path.home()
+        / "Library" / "Application Support" / "Serato" / "Library" / "master.sqlite"
+    )
 
 
 def connect_serato_library_readonly(library_path: Path) -> sqlite3.Connection:
     """Open Serato's master.sqlite in read-only mode.
 
-    Safe to use while Serato DJ Pro is running: WAL mode plus a busy
-    timeout means we coexist with the live writer rather than blocking it.
+    The database is not changed. In WAL mode a reader does not block
+    Serato's writer: that is SQLite's documented behaviour, and it was not
+    measured here against a running Serato. SQLite still rewrites the
+    ``-shm`` file beside a WAL-mode database on a read-only open (measured
+    on 27 November 2026).
     """
-    uri = f"file:{library_path}?mode=ro"
+    # as_uri() escapes the path. A bare f-string cut the name at a '#' or '?'
+    # and dropped mode=ro with it, so SQLite opened another file for writing.
+    uri = f"{library_path.resolve().as_uri()}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=10.0)
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.row_factory = sqlite3.Row

@@ -106,9 +106,8 @@ def test_gather_diagnostics_counts(synthetic_library):
     assert {loc[0] for loc in report.by_location} == {1, 5}
     # Location 1 has 7 rows, 1 missing, 1 corrupt
     by_loc = {loc[0]: loc for loc in report.by_location}
-    # The synthetic schema has no `location` table, so the path slot is "".
-    assert by_loc[1] == (1, 7, 1, 1, "")
-    assert by_loc[5] == (5, 1, 0, 0, "")
+    assert by_loc[1] == (1, 7, 1, 1)
+    assert by_loc[5] == (5, 1, 0, 0)
 
 
 def test_gather_diagnostics_duplicate_metric_uses_strong_key(synthetic_library):

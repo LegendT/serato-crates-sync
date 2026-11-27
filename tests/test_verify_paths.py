@@ -296,7 +296,9 @@ def test_fixes_from_moves_matches_a_name_stored_in_the_other_unicode_form(tmp_pa
     assert report.to_fix == 1
 
 
-def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):    # INFORMAL_SCHEMA: the real shape
+def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
+    # INFORMAL_SCHEMA is not Serato's real shape (see tests/_schemas.py). On the real one the
+    # merge loses the memberships: test_merge_moves_memberships_on_the_real_shape, test_fix_paths.py.
     """The rows --from-moves writes are applied by the unchanged fix-paths: a set-aside spare
     merges into the kept copy's row (crate memberships move), a renamed file's row changes path."""
     d = tmp_path / "music"
@@ -369,3 +371,57 @@ def test_fixes_from_moves_repairs_every_row_of_one_file(tmp_path):
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
     assert report.to_fix == 2
     assert sorted(r["asset_id"] for r in rows) == ["1", "2"]
+
+
+# ---- search mode: rows it must not call broken (27 November 2026)
+
+
+@pytest.mark.parametrize("disk_form, stored_form", [("NFC", "NFD"), ("NFD", "NFC")])
+def test_search_finds_a_name_stored_in_the_other_unicode_form(tmp_path, disk_form, stored_form):
+    """Serato holds the name decomposed and the file on disk is composed, or the reverse.
+    It is the same file name: the row is an auto repair, not an orphan to delete."""
+    music = tmp_path / "music"
+    (music / "New").mkdir(parents=True)
+    on_disk = music / "New" / unicodedata.normalize(disk_form, "Zéro.mp3")
+    on_disk.write_bytes(b"x")
+    on_disk = next((music / "New").iterdir())          # the name as the filesystem gives it back
+    stored = str(music / "Old" / unicodedata.normalize(stored_form, "Zéro.mp3")).lstrip("/")
+    conn = _library([{"location_id": 1, "portable_id": stored, "file_name": "Zéro.mp3"}])
+    out = tmp_path / "fixes.csv"
+    report = verify_assets_against_filesystem(conn, build_filesystem_index(music, DEFAULT_AUDIO_EXTENSIONS), out)
+    assert (report.auto_fix, report.orphan) == (1, 0)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert rows[0]["proposed_new_portable_id"] == str(on_disk).lstrip("/")
+
+
+def test_search_does_not_check_streaming_or_other_volume_rows(tmp_path):
+    """A streaming entry and a path relative to another drive are not files on this
+    volume. They are counted apart, never written to the repair file, never orphans."""
+    music = tmp_path / "music"
+    music.mkdir()
+    conn = _library([
+        {"location_id": 6, "portable_id": "streaming:tidal/12345", "file_name": "12345"},
+        {"location_id": 10, "portable_id": "NO SUCH DRIVE 7f3a/Albums/x.flac", "file_name": "x.flac"},
+        {"location_id": 1, "portable_id": str(music / "gone.mp3").lstrip("/"), "file_name": "gone.mp3"},
+    ])
+    out = tmp_path / "fixes.csv"
+    report = verify_assets_against_filesystem(conn, build_filesystem_index(music, DEFAULT_AUDIO_EXTENSIONS), out)
+    assert (report.total_checked, report.not_local, report.healthy, report.orphan) == (3, 2, 0, 1)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert [r["old_portable_id"] for r in rows] == [str(music / "gone.mp3").lstrip("/")]
+
+
+@pytest.mark.parametrize("stored_size, expected", [(4, "auto"), (9, "ambiguous"), (None, "auto")])
+def test_search_does_not_call_a_file_of_another_size_a_clear_match(tmp_path, stored_size, expected):
+    """One file on disk has the broken row's name. With the size Serato holds it is an
+    auto repair. With another size it may be another recording: a person picks. With no
+    stored size there is nothing to compare, and it stays auto."""
+    music = tmp_path / "music"
+    (music / "New").mkdir(parents=True)
+    (music / "New" / "Track01.mp3").write_bytes(b"AAAA")          # 4 bytes
+    conn = _library([{"location_id": 1, "portable_id": str(music / "Old" / "Track01.mp3").lstrip("/"),
+                      "file_name": "Track01.mp3", "file_size": stored_size}])
+    out = tmp_path / "fixes.csv"
+    verify_assets_against_filesystem(conn, build_filesystem_index(music, DEFAULT_AUDIO_EXTENSIONS), out)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert rows[0]["confidence"] == expected

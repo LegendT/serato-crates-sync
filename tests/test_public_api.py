@@ -17,6 +17,7 @@ MODULES = [
     "serato_crates_sync.diagnose",
     "serato_crates_sync.verify_paths",
     "serato_crates_sync.fix_paths",
+    "serato_crates_sync.serato_db",
 ]
 
 

@@ -25,7 +25,6 @@ from serato_crates_sync.sync import (
     create_sync_plan,
     get_existing_crate_names,
     is_audio_file,
-    scan_folder_for_tracks,
     write_crate_binary,
 )
 
@@ -105,37 +104,6 @@ class TestAudioDetection:
         assert is_audio_file(directory, DEFAULT_AUDIO_EXTENSIONS) is False
 
 
-class TestFolderScanning:
-    """Tests for folder scanning."""
-
-    def test_scan_folder_for_tracks(self, temp_music_folder):
-        tracks = scan_folder_for_tracks(
-            temp_music_folder / "House" / "Deep",
-            DEFAULT_AUDIO_EXTENSIONS
-        )
-        assert len(tracks) == 2
-        assert all(t.suffix == ".mp3" for t in tracks)
-
-    def test_scan_folder_excludes_non_audio(self, temp_music_folder):
-        tracks = scan_folder_for_tracks(
-            temp_music_folder / "HipHop",
-            DEFAULT_AUDIO_EXTENSIONS
-        )
-        # Should include mp3 and m4a, but not txt
-        assert len(tracks) == 2
-        names = {t.name for t in tracks}
-        assert "track4.mp3" in names
-        assert "track5.m4a" in names
-        assert "readme.txt" not in names
-
-    def test_scan_empty_folder(self, temp_music_folder):
-        tracks = scan_folder_for_tracks(
-            temp_music_folder / "EmptyFolder",
-            DEFAULT_AUDIO_EXTENSIONS
-        )
-        assert len(tracks) == 0
-
-
 class TestCrateTreeBuilding:
     """Tests for crate tree building."""
 
@@ -164,16 +132,9 @@ class TestCrateTreeBuilding:
         assert "Classic" in child_names
 
     def test_build_crate_tree_excludes_hidden(self, temp_music_folder):
-        # Build tree from root - should not include .hidden
-        crates = []
-        for item in sorted(temp_music_folder.iterdir()):
-            if item.is_dir() and not item.name.startswith("."):
-                crate = build_crate_tree(item, DEFAULT_AUDIO_EXTENSIONS)
-                if crate:
-                    crates.append(crate)
-
-        crate_names = {c.name for c in crates}
-        assert ".hidden" not in crate_names
+        # .hidden holds an audio file, so only the skip keeps it out of the tree.
+        root = build_crate_tree(temp_music_folder, DEFAULT_AUDIO_EXTENSIONS)
+        assert {c.name for c in root.children} == {"House", "HipHop"}
 
     def test_build_crate_tree_empty_folder_excluded(self, temp_music_folder):
         crate = build_crate_tree(
@@ -345,10 +306,37 @@ class TestIntegration:
         execute_sync(plan, overwrite=True)
 
         subcrates = get_subcrates_folder(temp_serato_folder)
-        crate_files = list(subcrates.glob("*.crate"))
+        # One file for each folder that holds audio, nested with %%, beside the crate
+        # that was already there. (">= 1" passed on that existing crate alone.)
+        assert sorted(f.name for f in subcrates.glob("*.crate")) == [
+            "ExistingCrate.crate",
+            "MusicRoot%%HipHop.crate",
+            "MusicRoot%%House%%Classic.crate",
+            "MusicRoot%%House%%Deep.crate",
+            "MusicRoot%%House.crate",
+            "MusicRoot.crate",
+        ]
+        # The track paths are in the file, stored without their leading slash.
+        deep = (subcrates / "MusicRoot%%House%%Deep.crate").read_bytes()
+        stored = str((temp_music_folder / "House" / "Deep" / "track1.mp3").resolve()).lstrip("/")
+        assert stored.encode("utf-16-be") in deep
 
-        # Should have created crates (plus the existing one)
-        assert len(crate_files) >= 1
+    def test_apply_reports_failure_when_no_crate_is_written(
+        self, temp_music_folder, temp_serato_folder, monkeypatch
+    ):
+        """Nothing written is not a success: sync must not exit 0 on it."""
+        import sys
+
+        from serato_crates_sync.sync import execute_sync
+
+        monkeypatch.setitem(sys.modules, "serato_crate", None)   # the import now fails
+        plan = create_sync_plan(
+            music_root=temp_music_folder,
+            serato_root=temp_serato_folder,
+            extensions=DEFAULT_AUDIO_EXTENSIONS
+        )
+        assert execute_sync(plan, clean=True) is False
+        assert list(get_subcrates_folder(temp_serato_folder).glob("*.crate")) == []
 
     def test_apply_creates_backup(self, temp_music_folder, temp_serato_folder):
         """Verify apply creates backup."""
@@ -366,3 +354,22 @@ class TestIntegration:
         # Check for backup folder
         backups = list(temp_serato_folder.glob("Subcrates.BACKUP.*"))
         assert len(backups) >= 1
+
+
+class TestGuide:
+    """The guide command's folder tree."""
+
+    def test_max_depth_and_total(self, capsys):
+        """--max-depth 2 shows two levels of folders. The total is every folder that
+        holds audio at any depth, not only the ones the tree had room for."""
+        from serato_crates_sync.sync import print_serato_guide
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir) / "R"
+            (root / "a" / "b" / "c" / "d").mkdir(parents=True)
+            (root / "a" / "b" / "c" / "d" / "x.mp3").touch()
+            print_serato_guide(root, DEFAULT_AUDIO_EXTENSIONS, 2)
+        out = capsys.readouterr().out
+        shown = [line for line in out.splitlines() if "── " in line]
+        assert [line.split("── ")[1].split(" ")[0] for line in shown] == ["a", "b"]
+        assert "Total folders to create as crates: 5 " in out

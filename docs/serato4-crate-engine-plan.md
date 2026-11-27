@@ -1,6 +1,17 @@
 # Plan — Serato DJ 4.x crate engine
 
-**Status:** Mechanism fully proven by two live POCs (2026-05-31). Ready to build.
+**Status (27 November 2026): built, and kept as a record.** The engine below was built in
+`serato_db.py` and merged in pull request 10. This file is the plan as it stood on 31 May 2026,
+and the only record of the two proofs of concept. It is not kept up to date. Where it differs
+from the code, the code and [internals.md](internals.md#serato-4x-crate-engine) are right.
+Known differences: `--purge-assets` and the clean-up of old `.crate` files were not built;
+`--prune` only removes, it does not also add; the previews print counts, not names; the check
+is `quick_check`, not `integrity_check`; the Serato-quit guard still uses `pgrep -f`; the
+functions have other names; no minimum Serato version was ever written down. The codes F2 to
+F11 point at a review that is not in this repository. Everything here was measured on
+Serato 4.x (schema version 202).
+
+**Status when written:** Mechanism fully proven by two live POCs (2026-05-31). Ready to build.
 **Goal:** Make `sync` mirror a folder tree into Serato DJ Pro 4.x as nested crates — creating the tracks too — by writing the SQLite library directly instead of legacy `.crate` files.
 
 ## Why

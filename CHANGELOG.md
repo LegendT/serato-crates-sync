@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-11-27
+
+The version number is now set in one place, `src/serato_crates_sync/__init__.py`.
+
 ### Added
+
+- `sync --library-dir FOLDER` (Serato 4.x and later): run on a copy of the
+  library folder.
+- `sync --keep-backups N|all`: after a write that succeeded, the tool keeps
+  its own backups of the newest N runs (default 3) and removes its older
+  ones, by file name alone. A dry run lists what would go.
 
 - **`verify-paths --from-moves FILE`.** Builds the repair rows from the
   record of moves that the moving tool kept, with no search. The record
@@ -25,9 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `master.sqlite` and analyses new tracks on next launch. New module
   `serato_db.py`.
   - Dry-run by default with a count-only preview; `--apply` to write.
-  - Refuses to write while Serato is open; backs up `root.sqlite` and
-    `master.sqlite`; single `BEGIN IMMEDIATE` transaction with
-    integrity check and WAL checkpoint.
+  - Refuses to write while Serato is open; backs up `root.sqlite`,
+    `master.sqlite` and the manifest; single `BEGIN IMMEDIATE`
+    transaction with `foreign_key_check`, `quick_check` and WAL checkpoint.
   - Additive and idempotent via a manifest of tool-created crates; never
     modifies user-made crates.
   - `--top-level` (folders at top level instead of one wrapper crate),
@@ -44,6 +54,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `sync --apply` refuses a library whose schema version it has not been
+  checked on (checked: 202 and 203), and a music root under `/Volumes`.
+  A dry run still works.
+- A refusal for want of a terminal exits 1, not 0.
+- `sync` backups are snapshots made with SQLite's Backup API.
+- The manifest records each crate's name and parent. A crate that no
+  longer matches its record is left alone. Older manifests are still read.
+- `--prune` and `--clean` cannot be given together, and no longer empty
+  Serato's own tracking tables in `master.sqlite`.
+- A flag for the other Serato route is named in a warning.
+- Tracks already in the library are matched in either Unicode form and
+  ASCII case.
+- `verify-paths`: a best match of another size than Serato holds is
+  `ambiguous`.
+- `fix-paths`: a backup that fails its check is deleted.
+- `guide --max-depth N` shows N levels, and its total counts every folder
+  that holds audio. `diagnose` lists locations by id only.
+- Removed: the unused `typing_extensions` dependency,
+  `get_serato_cache_folder`, `scan_folder_for_tracks`,
+  `CratePlan.full_name`, and the invented Linux library path.
+- **`sync --prune` and `sync --clean` refuse `--apply` on Serato 5.0.**
+  Its `master.sqlite` uses a collation only Serato has, so the tool
+  cannot check that file after a write. Such a run used to remove the
+  crates from `root.sqlite`, rewrite the manifest, then fail on
+  `master.sqlite`. It now stops before it writes anything.
+- `sync --prune` keeps a crate whose folder is still on disk. It used to
+  remove one made with `--include-empty`, and one whose files did not
+  match the `--extensions` of the prune run.
+- `sync --prune` and `sync --clean` keep a tool-created crate that holds
+  a crate you made. Removing it removed yours with it.
+- Each `sync --apply`, `--prune` and `--clean` on Serato 4.x and later
+  also backs up the manifest. A restore is now three files.
+- A `fix-paths` dry run writes its rows to `fix-paths-dry-run.csv`. It
+  used to write `fix-paths-applied.csv`, over the record of an earlier
+  `--apply`.
+- `fix-paths --repair-only` keeps orphan rows. It used to delete them.
+- `fix-paths` leaves rows behind any foreign key to the engine. It used
+  to delete the play history (`history_entry`) of an orphan track, which
+  Serato keeps.
+- `verify-paths` does not check streaming entries or entries on another
+  drive: they are counted as "Not checked". They used to be reported as
+  broken, and most as orphans.
+- `verify-paths` matches a file name in either Unicode form.
+- `sync --apply` on Serato 3.x exits 1 when a crate could not be
+  written. It used to exit 0 with nothing written.
+- The `dev` extra installs `ruff`.
 - If a `root.sqlite` is beside the library file (Serato 4.x and later),
   `fix-paths --apply` refuses to run and writes nothing. A dry run still
   works.
@@ -62,6 +118,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync.sh` wrapper now defaults to `~/Music/_DJ MUSIC` (was
   `~/Music/DJ`). Override per-run with `MUSIC_ROOT`, or edit the
   wrapper to change it permanently.
+
+### Fixed
+
+- A `--library-path` with `#` or `?` in it made every read-only command
+  open another file, for writing.
+- An error before the `sync` transaction opened was hidden by a failed
+  `ROLLBACK`, and a failed removal did not say why.
+- `guide` said that Serato 4.0.x cannot have crates made from outside.
+- The `sync` smoke test read the Serato library of the machine it ran
+  on. Tests were added for the safety rules that had none.
+- Docs: the README, usage.md, internals.md, troubleshooting.md,
+  SECURITY.md and CONTRIBUTING.md say which Serato version each
+  statement is for, and internals.md has a table of what each statement
+  about Serato rests on. A known fault is recorded: on Serato's real
+  tables a `fix-paths` merge loses the crate memberships it is meant to
+  move.
 
 ## [0.3.0] — 2026-05-07
 
@@ -208,7 +280,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ETA in `fix-paths` progress reporting.
 - Top broken-path-prefix summary in `verify-paths` reporting.
 
-## [0.1.0] — Initial
+## [0.1.0] — 2026-04-19
 
 - `sync` subcommand: generate Serato DJ Pro crates from a folder
   hierarchy. Dry-run by default, automatic `Subcrates.BACKUP.<timestamp>`
@@ -216,7 +288,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `guide` subcommand: print step-by-step instructions for manually
   creating crates in Serato.
 
-[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.4.0
 [0.3.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.3.0
 [0.2.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.2.0
 [0.1.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.1.0

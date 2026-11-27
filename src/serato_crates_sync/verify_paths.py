@@ -59,13 +59,17 @@ FIX_COLUMNS = [
 
 @dataclass
 class PathVerificationReport:
-    """Result of checking every asset's path against the filesystem."""
+    """Result of checking every asset's path against the filesystem.
+
+    ``total_checked`` counts every row read: healthy, broken and ``not_local``.
+    """
     total_checked: int
     healthy: int
     auto_fix: int
     ambiguous: int
     orphan: int
     top_broken_prefixes: list[tuple[str, int]] = field(default_factory=list)
+    not_local: int = 0   # streaming entries and paths on another volume: not checked
 
 
 def portable_id_to_fs_path(portable_id: str) -> str:
@@ -90,13 +94,16 @@ def build_filesystem_index(
     extensions: frozenset[str],
     exclude: frozenset[str] = frozenset(),
 ) -> dict[str, list[tuple[str, int]]]:
-    """Walk music_root once, returning filename.lower() -> [(path, file_size_bytes), ...].
+    """Walk music_root once, returning file name -> [(path, file_size_bytes), ...].
 
-    File sizes are captured during the walk via ``os.scandir`` (which already
-    has the stat available, so no extra syscall). This lets ``find_candidates``
-    compare against the asset row's ``file_size`` with a dict lookup instead
-    of stat-ing every candidate at lookup time — a measurable saving on
-    libraries with many same-named files (``Track01.mp3`` etc.).
+    The key is the file name in Unicode NFC form, lower-cased: the same name
+    can be stored composed on disk and decomposed in Serato, or the other way
+    round, and both forms must find it.
+
+    File sizes are read during the walk (one ``stat`` call for each file on
+    macOS and Linux). ``find_candidates`` then compares against the asset
+    row's ``file_size`` with a dict lookup and makes no ``stat`` call of its
+    own, which matters where many files share a name (``Track01.mp3`` etc.).
 
     A size of ``-1`` means the stat failed for that entry.
 
@@ -132,7 +139,7 @@ def build_filesystem_index(
                 size = entry.stat(follow_symlinks=False).st_size
             except OSError:
                 size = -1
-            index.setdefault(entry.name.lower(), []).append(
+            index.setdefault(_nfc(entry.name).lower(), []).append(
                 (entry.path, size)
             )
 
@@ -170,7 +177,7 @@ def find_candidates(
     were captured during the fs-walk so this is a dict comparison, not
     a stat-storm at lookup time.
     """
-    fname = os.path.basename(broken_path).lower()
+    fname = _nfc(os.path.basename(broken_path)).lower()
     entries = list(fs_index.get(fname, []))
     if not entries:
         return []
@@ -225,8 +232,22 @@ def verify_assets_against_filesystem(
         "       artist, name FROM asset ORDER BY id"
     )
 
-    healthy = auto_fix = ambiguous = orphan = total = 0
+    healthy = auto_fix = ambiguous = orphan = total = not_local = 0
     broken_prefix_counts: dict[str, int] = {}
+
+    # Not every portable_id is a file on this volume. Serato also holds streaming
+    # entries ("streaming:...") and paths that are relative to another drive
+    # ("MUSIC ARCHIVE/..."): 36,119 of 490,057 rows in the library measured on
+    # 27 November 2026. Put a slash in front of those and nothing is there, so
+    # they were all reported as broken, and most as orphans for fix-paths to delete.
+    # A row is checked only where the first folder of its path exists here.
+    top_folder_exists: dict[str, bool] = {}
+
+    def on_this_volume(fs_path: str) -> bool:
+        top = fs_path.split(os.sep, 2)[1]
+        if top not in top_folder_exists:
+            top_folder_exists[top] = os.path.isdir(os.sep + top)
+        return top_folder_exists[top]
 
     csv_file = None
     csv_writer = None
@@ -242,7 +263,9 @@ def verify_assets_against_filesystem(
             portable_id = row["portable_id"] or ""
             fs_path = portable_id_to_fs_path(portable_id)
 
-            if os.path.exists(fs_path):
+            if not on_this_volume(fs_path):
+                not_local += 1
+            elif os.path.exists(fs_path):
                 healthy += 1
             else:
                 key = _broken_prefix_key(fs_path, music_root)
@@ -251,6 +274,13 @@ def verify_assets_against_filesystem(
                 file_size_db = row["file_size"]
                 candidates = find_candidates(fs_path, file_size_db, fs_index)
                 confidence = classify_candidates(fs_path, candidates)
+                # The best match has another size than the one Serato holds: it is as
+                # likely another recording with the same file name as the same file.
+                # Leave that choice to a person. Only where both sizes are known.
+                if confidence == "auto" and file_size_db:
+                    sizes = dict(fs_index.get(_nfc(os.path.basename(fs_path)).lower(), ()))
+                    if sizes.get(candidates[0], -1) not in (-1, file_size_db):
+                        confidence = "ambiguous"
 
                 if confidence == "orphan":
                     orphan += 1
@@ -297,6 +327,7 @@ def verify_assets_against_filesystem(
         ambiguous=ambiguous,
         orphan=orphan,
         top_broken_prefixes=top_prefixes,
+        not_local=not_local,
     )
 
 
@@ -314,9 +345,8 @@ class MovesReport:
 def load_moves(path: Path) -> list[tuple[str, str]]:
     """(old path, new path) pairs from a moves file.
 
-    Accepted shapes, all JSON: an object with an ``ops`` list (the
-    ``crate-map.json`` a musicsync dedupe writes), a plain list, or one
-    object per line. Each object needs absolute ``src`` and ``dst`` paths;
+    Accepted shapes, all JSON: an object with an ``ops`` list, a plain
+    list, or one object per line. Each object needs absolute ``src`` and ``dst`` paths;
     other keys are ignored.
     """
     text = path.read_text(encoding="utf-8")
@@ -370,6 +400,8 @@ def fixes_from_moves(
     """
     # A list per path: one file can have more than one row (a portable_id
     # stored with and without its leading slash), and each row needs its repair.
+    # No row in the library measured on 27 November 2026 has a leading slash, so
+    # this guards a case that was not seen there.
     rows: dict[str, list[sqlite3.Row]] = {}
     nfc_rows: dict[str, list[sqlite3.Row]] = {}
     for row in conn.execute(
@@ -438,7 +470,8 @@ def print_path_verification_report(report: PathVerificationReport) -> None:
     print(f"\n{'='*60}")
     print("PATH VERIFICATION REPORT")
     print(f"{'='*60}")
-    print(f"Total assets checked:  {report.total_checked:>10,}")
+    print(f"Total assets read:     {report.total_checked:>10,}")
+    print(f"Not checked:           {report.not_local:>10,}  (streaming entries, paths on another drive)")
     print(f"Healthy (path exists): {report.healthy:>10,}")
     print(f"Broken total:          {broken:>10,}")
     print(f"  auto-fix candidate:  {report.auto_fix:>10,}")

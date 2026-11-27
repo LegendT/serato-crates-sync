@@ -11,9 +11,18 @@ subcommand reference see [usage.md](usage.md).
 - [Tool can't find serato-crate](#tool-cant-find-serato-crate)
 - [How to roll back](#how-to-roll-back)
 
+The first three sections are about `.crate` files, which only Serato
+3.x reads. Each says what to do on Serato 4.x and later instead.
+
 ## Old crates still showing in Serato
 
-Happens when Serato's cache contains old crate data. Solution:
+**Serato 4.x and later.** A re-run of `sync` adds and never removes.
+Remove the crates of folders that are gone with
+`serato-crates sync --music-root ~/Music/DJ --apply --prune`, then run
+`sync --apply` again. On Serato 5.0 `--prune` refuses `--apply`: delete
+the crates in Serato.
+
+**Serato 3.x.** Happens when Serato's cache contains old crate data. Solution:
 
 1. **Close Serato completely** (Cmd+Q).
 2. **Run with `--clean`:**
@@ -24,6 +33,17 @@ Happens when Serato's cache contains old crate data. Solution:
 
 ## Crates don't appear in Serato
 
+**Serato 4.x and later.** Check four things. Serato must be quit and
+started again after the run. The report must not say `skipped (not
+ours)`: a crate of the same name that the tool did not make is left
+alone, with everything under it. `--clean` must not have been given:
+there it removes crates and writes none. And the run must not have
+been refused: `sync --apply` refuses, with exit code 1, a library
+version it has not been checked on, a music root on another drive, and
+a large change when there is no terminal to ask at and no `--yes`.
+
+**Serato 3.x:**
+
 1. Make sure Serato was **completely closed** before running the tool.
 2. Check that `--serato-root` points to the correct folder.
 3. Verify crate files were created: `ls ~/Music/_Serato_/Subcrates/`.
@@ -31,6 +51,8 @@ Happens when Serato's cache contains old crate data. Solution:
    from scratch.
 
 ## Tracks show as missing in Serato
+
+Steps 1 to 3 are for Serato 3.x. Step 4 is for every version.
 
 1. Check `--path-mode` setting matches your setup.
 2. For external drives, try `--path-mode relative-to-volume-root`.
@@ -58,12 +80,12 @@ Either:
 <a id="serato-operation-failed"></a>
 ## Serato shows "Operation failed. Crates and files may not appear correctly"
 
-This was caused on `fix-paths` v0.1.x by dangling rows left behind in
-tables with informal `asset_id` columns (no foreign key) —
-`container_asset` and the `anonymous_table_*` sort caches. **v0.2.0+
-cleans these up automatically**, so you should not hit this on the
-current code. If you encounter it on an older version, or if Serato
-reports it for unrelated reasons:
+This was caused by `fix-paths` before its first release, by dangling
+rows left behind in tables with informal `asset_id` columns (no foreign
+key) — `container_asset` and the `anonymous_table_*` sort caches.
+**Every release with `fix-paths` (v0.2.0 and later) cleans these up**,
+so you should not hit this on the current code. If Serato reports it
+for unrelated reasons:
 
 1. Quit Serato (Cmd+Q).
 2. Check `~/Music/_Serato_/Logs/` — the most recent log usually pinpoints
@@ -74,7 +96,10 @@ reports it for unrelated reasons:
    - **Forward-fix** by deleting any rows whose `asset_id` no longer
      exists in the asset table. The dangling tables in past incidents
      were `container_asset` and `anonymous_table_0` /
-     `anonymous_table_1` / `anonymous_table_2`.
+     `anonymous_table_1` / `anonymous_table_2`. On a Serato 5.0 library
+     this cannot be done outside Serato: a delete from an
+     `anonymous_table_*` table fails with `no such collation sequence:
+     serato_asset_string_comparator`. Roll back instead.
 
 ## Tool can't find serato-crate
 
@@ -88,7 +113,43 @@ pip install -e .
 
 ## How to roll back
 
-### Sync (Subcrates)
+### Sync on Serato 4.x and later (`root.sqlite`, `master.sqlite`, the manifest)
+
+Each `sync --apply`, `--prune` and `--clean` first makes three backups
+with one timestamp. The tool keeps the backups of its newest 3 runs
+(`--keep-backups` changes that), so an older run can no longer be undone
+this way. Restore all three, or none:
+
+```bash
+# 1. Close Serato DJ Pro (Cmd+Q)
+
+cd "$HOME/Library/Application Support/Serato/Library/"
+
+# 2. Find the backups of the run to undo (one timestamp, three files)
+ls root.sqlite.BACKUP.* master.sqlite.BACKUP.* .serato-crates-sync/manifest.json.BACKUP.*
+
+# 3. Restore them (replace TIMESTAMP), and remove the write-ahead files
+cp root.sqlite.BACKUP.TIMESTAMP root.sqlite
+cp master.sqlite.BACKUP.TIMESTAMP master.sqlite
+rm -f master.sqlite-wal master.sqlite-shm
+cp .serato-crates-sync/manifest.json.BACKUP.TIMESTAMP .serato-crates-sync/manifest.json
+
+# 4. Open Serato DJ Pro
+```
+
+The manifest matters as much as the databases. It lists the crates the
+tool made by id. A restored `root.sqlite` gives the ids of later crates
+out again, so with a newer manifest left in place a crate you make
+afterwards can get an id the manifest lists. The tool also compares the
+name and parent it recorded for each crate, and leaves a crate alone
+when they differ. A manifest written before 27 November 2026 has no
+such record until the next `sync --apply` for that music root.
+A run made before 27 November 2026 has no manifest backup. After
+restoring the databases of such a run, open `manifest.json` and delete
+the entry of each music root that run wrote. The tool then treats the
+crates of that root as yours and leaves them alone.
+
+### Sync on Serato 3.x (Subcrates)
 
 If `sync --apply` left the Crates panel in a bad state, restore the
 crate folder:
