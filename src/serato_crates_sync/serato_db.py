@@ -170,15 +170,21 @@ def discover_anchors(conn: sqlite3.Connection) -> Anchors:
     return Anchors(space_id=space_id, root_container_id=root[0])
 
 
-def _untested_schema(conn: sqlite3.Connection) -> str | None:
-    """Why --apply is refused on this library, or None where its schema version is a measured one."""
+SCHEMA_NAMES = {202: "Serato 4.x", 203: "Serato 5.0.0"}
+
+
+def _untested_schema(conn: sqlite3.Connection,
+                     checked: frozenset = MEASURED_SCHEMA_VERSIONS,
+                     command: str = "sync") -> str | None:
+    """Why --apply is refused on this library, or None where its schema version is one
+    the command has been checked on. Each command passes its own set."""
     version = conn.execute("PRAGMA user_version").fetchone()[0]
-    if version in MEASURED_SCHEMA_VERSIONS:
+    if version in checked:
         return None
+    versions = " and ".join(f"{v} ({SCHEMA_NAMES.get(v, 'unnamed')})" for v in sorted(checked))
     return (
-        f"root.sqlite is at schema version {version}. This tool has been checked on versions "
-        f"{' and '.join(str(v) for v in sorted(MEASURED_SCHEMA_VERSIONS))} only (Serato 4.x and "
-        "5.0.0), so it does not write to this library."
+        f"root.sqlite is at schema version {version}. {command} has been checked on "
+        f"{versions} only, so it does not write to this library."
     )
 
 

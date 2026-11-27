@@ -309,7 +309,7 @@ def test_verify_paths_exclude_smoke(monkeypatch, tmp_path, capsys):
     assert rc == 0
     rows = list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8")))
     assert all("_Superseded" not in r["proposed_new_portable_id"] for r in rows)
-    assert "fix-paths --apply refuses" in capsys.readouterr().out     # the 4.x caution, search mode too
+    assert "fix-paths --apply writes these repairs to root.sqlite" in capsys.readouterr().out
 
 
 def test_verify_paths_exclude_refuses_a_path(monkeypatch, tmp_path, capsys):
@@ -324,116 +324,43 @@ def test_verify_paths_exclude_refuses_a_path(monkeypatch, tmp_path, capsys):
     assert "folder name, not a path" in capsys.readouterr().err
 
 
-def test_fix_paths_apply_refused_beside_root_sqlite(monkeypatch, tmp_path):
-    """Serato 4.x and later: a root.sqlite beside the library stops --apply before
-    any write, even the backup; the dry run still works."""
-    music = _make_music_root(tmp_path / "music")
-    library = tmp_path / "master.sqlite"
-    _make_real_shape_library(library)
-    _seed_assets(library, music)
-    (tmp_path / "root.sqlite").write_bytes(b"")
-    # Serato may be open on a developer's machine. Without this, the Serato-running
-    # refusal would return 1 as well, and the test would pass with the guard removed.
+# ---------------------------------------------------------------------------
+# fix-paths: the repairs go to the root.sqlite beside the --library-path given.
+# The rules of a run that writes are tested in tests/test_fix_paths.py; these
+# cover the wiring from the command line.
+# ---------------------------------------------------------------------------
+
+def _library_with_fixes(monkeypatch, tmp_path):
+    """A library folder with a master.sqlite and a root.sqlite that hold the same two
+    tracks, one healthy and one whose file is gone, and the path-fixes.csv for them."""
     import serato_crates_sync.fix_paths as fix_paths_module
+    import serato_crates_sync.serato_db as serato_db_module
+
+    from .test_serato_db import make_root_library
+    monkeypatch.setattr(serato_db_module, "_library_dir", None)      # put back after the test
     monkeypatch.setattr(fix_paths_module, "is_serato_running", lambda: False)
-    csv_out = tmp_path / "diag"
-    assert _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
-                    "--music-root", str(music), "--csv-out", str(csv_out)) == 0
-    before = library.read_bytes()
-    fixes = str(csv_out / "path-fixes.csv")
-
-    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                    "--from-csv", fixes, "--apply") == 1
-    assert library.read_bytes() == before
-    assert list(tmp_path.glob("master.sqlite.BACKUP.*")) == []
-    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                    "--from-csv", fixes) == 0
-
-
-def test_fix_paths_dry_run_smoke(monkeypatch, tmp_path):
+    # If --library-path were ever ignored, the engine must find an empty folder here
+    # and stop, not this machine's real library: some of these tests pass --apply.
+    monkeypatch.setattr(serato_db_module, "get_default_serato_library_path",
+                        lambda: tmp_path / "default library" / "master.sqlite")
     music = _make_music_root(tmp_path / "music")
-    library = tmp_path / "master.sqlite"
-    _make_real_shape_library(library)
-    _seed_assets(library, music)
-
-    csv_out = tmp_path / "diag"
-    _run_cli(
-        monkeypatch,
-        "verify-paths",
-        "--library-path", str(library),
-        "--music-root", str(music),
-        "--csv-out", str(csv_out),
-    )
-
-    rc = _run_cli(
-        monkeypatch,
-        "fix-paths",
-        "--from-csv", str(csv_out / "path-fixes.csv"),
-        "--library-path", str(library),
-    )
-    assert rc == 0
-
-
-def test_fix_paths_apply_smoke(monkeypatch, tmp_path):
-    """End-to-end --apply: verify the orphan row gets deleted and the
-    audit log appears at its final path (not the .inprogress tmp)."""
-    music = _make_music_root(tmp_path / "music")
-    library = tmp_path / "master.sqlite"
-    _make_real_shape_library(library)
-    _seed_assets(library, music)
-
-    csv_out = tmp_path / "diag"
-    _run_cli(
-        monkeypatch,
-        "verify-paths",
-        "--library-path", str(library),
-        "--music-root", str(music),
-        "--csv-out", str(csv_out),
-    )
-
-    # Stub the running-Serato guard so this test is stable on developer
-    # machines that happen to have Serato open.
-    import serato_crates_sync.fix_paths as fix_paths_module
-    monkeypatch.setattr(fix_paths_module, "is_serato_running", lambda: False)
-
-    audit_log = tmp_path / "audit.csv"
-    rc = _run_cli(
-        monkeypatch,
-        "fix-paths",
-        "--from-csv", str(csv_out / "path-fixes.csv"),
-        "--library-path", str(library),
-        "--audit-log", str(audit_log),
-        "--apply",
-    )
-    assert rc == 0
-    # Orphan asset (id=2) should be gone
-    conn = sqlite3.connect(str(library))
-    remaining = conn.execute("SELECT id FROM asset ORDER BY id").fetchall()
+    lib = tmp_path / "library"
+    lib.mkdir()
+    master = lib / "master.sqlite"
+    _make_real_shape_library(master)
+    _seed_assets(master, music)
+    root = make_root_library(lib, version=203)
+    conn = sqlite3.connect(root)
+    for asset_id, path in ((1, music / "House" / "Deep" / "track1.mp3"), (2, Path(_broken_file(music)))):
+        conn.execute("INSERT INTO asset (id, revision, portable_id) VALUES (?, 1, ?)",
+                     (asset_id, str(path).lstrip("/")))
+        conn.execute("INSERT INTO space_asset (id, asset_id, space_id) VALUES (?, ?, 2)",
+                     (100 + asset_id, asset_id))
+    conn.commit()
     conn.close()
-    assert remaining == [(1,)]
-    # Audit log appears at the final path; the .inprogress tmp does not
-    assert audit_log.exists()
-    assert not audit_log.with_name(audit_log.name + ".inprogress").exists()
-    # Backup file present alongside the library
-    backups = list(library.parent.glob(f"{library.name}.BACKUP.*"))
-    assert backups, "expected a master.sqlite.BACKUP.* file"
-
-
-# ---------------------------------------------------------------------------
-# The fix-paths safety rules of SECURITY.md that had no test (27 November 2026).
-# ---------------------------------------------------------------------------
-
-def _library_with_fixes(monkeypatch, tmp_path, serato_running=False):
-    """A library with one healthy and one orphan asset, and its path-fixes.csv."""
-    import serato_crates_sync.fix_paths as fix_paths_module
-    monkeypatch.setattr(fix_paths_module, "is_serato_running", lambda: serato_running)
-    music = _make_music_root(tmp_path / "music")
-    library = tmp_path / "master.sqlite"
-    _make_real_shape_library(library)
-    _seed_assets(library, music)
-    assert _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+    assert _run_cli(monkeypatch, "verify-paths", "--library-path", str(master),
                     "--music-root", str(music), "--csv-out", str(tmp_path / "diag")) == 0
-    return library, tmp_path / "diag" / "path-fixes.csv"
+    return master, root, tmp_path / "diag" / "path-fixes.csv"
 
 
 def _asset_ids(library: Path) -> list[int]:
@@ -444,80 +371,78 @@ def _asset_ids(library: Path) -> list[int]:
         conn.close()
 
 
-def test_fix_paths_apply_refuses_while_serato_runs(monkeypatch, tmp_path):
-    library, fixes = _library_with_fixes(monkeypatch, tmp_path, serato_running=True)
-    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                    "--from-csv", str(fixes), "--apply") == 1
-    assert _asset_ids(library) == [1, 2]
-    assert list(tmp_path.glob("master.sqlite.BACKUP.*")) == []
-
-
-def test_fix_paths_dry_run_leaves_the_applied_log_alone(monkeypatch, tmp_path):
-    """A dry run writes its rows to fix-paths-dry-run.csv. It must not write, or
-    overwrite, fix-paths-applied.csv: that file is the record of a run that wrote."""
-    library, fixes = _library_with_fixes(monkeypatch, tmp_path)
+def test_fix_paths_dry_run_smoke(monkeypatch, tmp_path):
+    """Without --apply nothing is written to the library, and the rows go to
+    fix-paths-dry-run.csv: never to fix-paths-applied.csv, the record of a run that wrote."""
+    master, root, fixes = _library_with_fixes(monkeypatch, tmp_path)
     applied = fixes.parent / "fix-paths-applied.csv"
     applied.write_text("the record of an earlier --apply\n")
+    before = root.read_bytes()
 
-    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library), "--from-csv", str(fixes)) == 0
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(master), "--from-csv", str(fixes)) == 0
+    assert root.read_bytes() == before
     assert applied.read_text() == "the record of an earlier --apply\n"
     assert "orphan_deleted" in (fixes.parent / "fix-paths-dry-run.csv").read_text()
-    assert _asset_ids(library) == [1, 2]
+    assert list(master.parent.glob("*.BACKUP.*")) == []
 
 
-def test_fix_paths_apply_rolls_back_on_error(monkeypatch, tmp_path):
-    """One good row, then a row that cannot be read: nothing of the run stays."""
-    import pytest
-    library, fixes = _library_with_fixes(monkeypatch, tmp_path)
-    with fixes.open("a", encoding="utf-8") as f:
-        f.write("not-a-number,1,x,y,auto,1,,,,,\n")
-    audit = tmp_path / "audit.csv"
-    with pytest.raises(ValueError):
-        _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                 "--from-csv", str(fixes), "--audit-log", str(audit), "--apply")
-    assert _asset_ids(library) == [1, 2]                    # the orphan delete was rolled back
-    assert not audit.exists()
+def test_fix_paths_apply_smoke(monkeypatch, tmp_path):
+    """--apply writes root.sqlite and leaves master.sqlite alone. The orphan goes, the
+    audit log is at its final path, and the three backups are in the library folder."""
+    master, root, fixes = _library_with_fixes(monkeypatch, tmp_path)
+    master_before = master.read_bytes()
+
+    # no terminal in a test run, and no --yes: refused, nothing written
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(master),
+                    "--from-csv", str(fixes), "--apply") == 1
+    assert _asset_ids(root) == [1, 2]
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(master),
+                    "--from-csv", str(fixes), "--apply", "--yes") == 0
+    assert _asset_ids(root) == [1]
+    assert master.read_bytes() == master_before
+    audit = fixes.parent / "fix-paths-applied.csv"
+    assert "orphan_deleted" in audit.read_text()
     assert not audit.with_name(audit.name + ".inprogress").exists()
+    lib = master.parent
+    assert list(lib.glob("root.sqlite.BACKUP.*")) and list(lib.glob("master.sqlite.BACKUP.*"))
+    assert list((lib / ".serato-crates-sync").glob("manifest.json.BACKUP.*"))
 
 
-def test_fix_paths_killed_run_leaves_no_audit_log(monkeypatch, tmp_path):
-    """Stopped part-way (Ctrl-C): the audit log must not be at its final path."""
-    import pytest
-
+def test_fix_paths_flags_reach_the_engine(monkeypatch, tmp_path):
+    """Each flag must arrive as itself. The engine is replaced by a recorder."""
     import serato_crates_sync.fix_paths as fix_paths_module
-    library, fixes = _library_with_fixes(monkeypatch, tmp_path)
+    import serato_crates_sync.serato_db as serato_db_module
+    calls = []
+    monkeypatch.setattr(serato_db_module, "_library_dir", None)
+    monkeypatch.setattr(fix_paths_module, "run_fix_paths", lambda csv, **kw: calls.append((csv, kw)) or 0)
+    lib = tmp_path / "library"
+    fixes = tmp_path / "path-fixes.csv"
 
-    def stop(*args, **kwargs):
-        raise KeyboardInterrupt
-    monkeypatch.setattr(fix_paths_module, "_process_fix_row", stop)
-    audit = tmp_path / "audit.csv"
-    with pytest.raises(KeyboardInterrupt):
-        _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                 "--from-csv", str(fixes), "--audit-log", str(audit), "--apply")
-    assert not audit.exists()
-    assert _asset_ids(library) == [1, 2]
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(lib / "master.sqlite"),
+                    "--from-csv", str(fixes)) == 0
+    assert serato_db_module.get_serato_library_dir() == lib.resolve()     # the folder of the file named
+    assert _run_cli(monkeypatch, "fix-paths", "--from-csv", str(fixes), "--apply", "--yes", "--keep-orphans",
+                    "--ambiguous-too", "--repair-only", "--keep-backups", "all",
+                    "--audit-log", str(tmp_path / "log.csv")) == 0
+    (csv_dry, dry), (csv_apply, write) = calls
+    assert csv_dry == fixes.resolve() and csv_apply == fixes.resolve()
+    assert (dry["apply"], dry["keep_orphans"], dry["ambiguous_too"], dry["repair_only"],
+            dry["keep_backups"], dry["assume_yes"]) == (False, False, False, False, 3, False)
+    assert dry["audit_log_path"] == tmp_path.resolve() / "fix-paths-dry-run.csv"
+    assert (write["apply"], write["keep_orphans"], write["ambiguous_too"], write["repair_only"],
+            write["keep_backups"], write["assume_yes"]) == (True, True, True, True, None, True)
+    assert write["audit_log_path"] == tmp_path.resolve() / "log.csv"
 
 
-def test_fix_paths_apply_checkpoints_the_wal(monkeypatch, tmp_path):
-    """Serato's master.sqlite is in WAL mode. After --apply the change must be in the
-    main file, so that a copy of master.sqlite alone has it."""
-    import shutil
-    library, fixes = _library_with_fixes(monkeypatch, tmp_path)
-    other = sqlite3.connect(str(library))
-    assert other.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
-    # `other` reads once and stays open, as Serato's own connection would. SQLite folds
-    # the WAL in by itself when the last connection closes, so without a second
-    # connection that has read, this test passes with no checkpoint at all.
-    assert other.execute("SELECT count(*) FROM asset").fetchone()[0] == 2
-    try:
-        assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
-                        "--from-csv", str(fixes), "--apply") == 0
-        alone = tmp_path / "alone" / "master.sqlite"
-        alone.parent.mkdir()
-        shutil.copy2(library, alone)                        # no -wal, no -shm
-    finally:
-        other.close()
-    assert _asset_ids(alone) == [1]
+def test_fix_paths_needs_a_root_sqlite(monkeypatch, tmp_path):
+    """A master.sqlite with no root.sqlite beside it: nothing to repair, with or without --apply."""
+    master, root, fixes = _library_with_fixes(monkeypatch, tmp_path)
+    root.unlink()
+    for flags in ([], ["--apply"]):
+        assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(master),
+                        "--from-csv", str(fixes), *flags) == 1
+    assert _asset_ids(master) == [1, 2]
+    assert list(master.parent.glob("*.BACKUP.*")) == []
 
 
 def test_version_is_set_in_one_place(monkeypatch, capsys):

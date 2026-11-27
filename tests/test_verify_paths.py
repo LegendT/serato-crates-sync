@@ -11,7 +11,6 @@ import unicodedata
 
 import pytest
 
-from serato_crates_sync.fix_paths import apply_fixes
 from serato_crates_sync.library import DEFAULT_AUDIO_EXTENSIONS
 from serato_crates_sync.verify_paths import (
     build_filesystem_index,
@@ -24,8 +23,6 @@ from serato_crates_sync.verify_paths import (
     score_candidate,
     verify_assets_against_filesystem,
 )
-
-from ._schemas import INFORMAL_SCHEMA
 
 ASSET_SCHEMA = """
 CREATE TABLE asset (
@@ -296,35 +293,48 @@ def test_fixes_from_moves_matches_a_name_stored_in_the_other_unicode_form(tmp_pa
     assert report.to_fix == 1
 
 
-def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
-    # INFORMAL_SCHEMA is not Serato's real shape (see tests/_schemas.py). On the real one the
-    # merge loses the memberships: test_merge_moves_memberships_on_the_real_shape, test_fix_paths.py.
-    """The rows --from-moves writes are applied by the unchanged fix-paths: a set-aside spare
-    merges into the kept copy's row (crate memberships move), a renamed file's row changes path."""
+def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path, monkeypatch):
+    """The rows --from-moves writes are applied by fix-paths to root.sqlite: a set-aside spare
+    merges into the kept copy's entry (its crate membership moves), a renamed file's entry
+    changes path."""
+    from serato_crates_sync import fix_paths, serato_db
+
+    from .test_serato_db import make_root_library
     d = tmp_path / "music"
     d.mkdir()
     (d / "kept.flac").write_bytes(b"x")
     (d / "new name.flac").write_bytes(b"x")
-    conn = sqlite3.connect(":memory:", isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(INFORMAL_SCHEMA)
-    for i, name in ((1, "kept.flac"), (2, "spare.flac"), (3, "old name.flac")):
-        conn.execute("INSERT INTO asset (id, location_id, portable_id) VALUES (?, 1, ?)", (i, _pid(d, name)))
-    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
-    conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 2)")     # the spare is in a crate
-    conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 3)")
-    for col in ("file_name TEXT", "file_size INTEGER", "artist TEXT DEFAULT ''", "name TEXT DEFAULT ''"):
-        conn.execute("ALTER TABLE asset ADD COLUMN " + col)
+    names = ("kept.flac", "spare.flac", "old name.flac")
+    master = _library([{"location_id": 1, "portable_id": _pid(d, n), "file_name": n} for n in names])
+    lib = tmp_path / "library"
+    lib.mkdir()
+    root = make_root_library(lib, version=203)
+    conn = sqlite3.connect(root)
+    for i, name in enumerate(names, 1):
+        conn.execute("INSERT INTO asset (id, revision, portable_id) VALUES (?, 1, ?)", (i, _pid(d, name)))
+        conn.execute("INSERT INTO space_asset (id, asset_id, space_id) VALUES (?, ?, 2)", (100 + i, i))
+    conn.execute("INSERT INTO container (id, revision, parent_id, name, type, list_order, space_id) "
+                 "VALUES (10, 1, 3, 'Crate', 1, 1, 2)")
+    conn.execute("INSERT INTO container_asset (revision, container_id, space_asset_id, list_order) "
+                 "VALUES (1, 10, 102, 1), (1, 10, 103, 2)")          # the spare and the old name
+    conn.commit()
+    conn.close()
+
     out = tmp_path / "fixes.csv"
-    report = fixes_from_moves(conn, [(str(d / "spare.flac"), str(d / "kept.flac")),
-                                     (str(d / "old name.flac"), str(d / "new name.flac"))], out)
+    report = fixes_from_moves(master, [(str(d / "spare.flac"), str(d / "kept.flac")),
+                                       (str(d / "old name.flac"), str(d / "new name.flac"))], out)
     assert report.to_fix == 2
-    stats = apply_fixes(conn, out, apply=True, keep_orphans=False, ambiguous_too=False,
-                        repair_only=False, audit_log_path=None)
-    assert (stats.merged, stats.updated) == (1, 1)
-    assert conn.execute("SELECT COUNT(*) FROM asset WHERE id = 2").fetchone()[0] == 0
-    assert conn.execute("SELECT portable_id FROM asset WHERE id = 3").fetchone()[0] == _pid(d, "new name.flac")
-    members = sorted(r[0] for r in conn.execute("SELECT asset_id FROM container_asset WHERE container_id = 10"))
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: lib)
+    monkeypatch.setattr(fix_paths, "is_serato_running", lambda: False)
+    assert fix_paths.run_fix_paths(out, apply=True, keep_orphans=False, ambiguous_too=False,
+                                   repair_only=False, audit_log_path=None, assume_yes=True) == 0
+    conn = sqlite3.connect(root)
+    assert sorted(r[0] for r in conn.execute("SELECT portable_id FROM asset")) == sorted(
+        [_pid(d, "kept.flac"), _pid(d, "new name.flac")])
+    members = sorted(r[0] for r in conn.execute(
+        "SELECT sa.asset_id FROM container_asset ca JOIN space_asset sa ON sa.id = ca.space_asset_id "
+        "WHERE ca.container_id = 10"))
+    conn.close()
     assert members == [1, 3]
 
 

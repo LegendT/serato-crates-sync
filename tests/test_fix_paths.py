@@ -1,585 +1,401 @@
-"""Tests for the fix-paths subcommand.
+"""Tests for the fix-paths subcommand, which writes path repairs to root.sqlite.
 
-Builds synthetic schemas (see tests/_schemas.py for what each one is and is
-not) and exercises the code paths: pure UPDATE, merge with re-parented
-memberships, orphan delete, the skips, dry-run. The first group uses the
-idealised schema, which is not Serato's shape; the tests at the end use
-MASTER_SHAPE_SCHEMA, which copies the real columns and foreign keys.
+Each test builds the cut-down root.sqlite of tests/test_serato_db.py in a
+temporary folder, seeds tracks and crates, and runs ``run_fix_paths`` on a
+path-fixes.csv. No test here may reach the Serato library of the machine it
+runs on: ``_library`` points the engine at the temporary folder first.
 """
 
 import csv
+import json
 import sqlite3
-from pathlib import Path
+import unicodedata
 
 import pytest
 
-from serato_crates_sync.fix_paths import (
-    apply_fixes,
-    backup_serato_library,
-    get_asset_referencing_columns,
-)
+from serato_crates_sync import fix_paths, serato_db
+from serato_crates_sync.fix_paths import run_fix_paths
 
-from ._schemas import IDEALISED_SCHEMA, INFORMAL_SCHEMA, MASTER_SHAPE_SCHEMA
+from .test_serato_db import make_root_library
 
-
-def _connect_with_schema():
-    conn = sqlite3.connect(":memory:", isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(IDEALISED_SCHEMA)
-    return conn
+CSV_COLUMNS = ["asset_id", "location_id", "old_portable_id", "proposed_new_portable_id", "confidence"]
 
 
-def _insert_asset(conn, asset_id, location_id, portable_id):
-    conn.execute(
-        "INSERT INTO asset (id, location_id, portable_id) VALUES (?, ?, ?)",
-        (asset_id, location_id, portable_id),
-    )
+@pytest.fixture
+def library(tmp_path, monkeypatch):
+    """A library folder with a root.sqlite in it, and the engine pointed at it."""
+    lib = tmp_path / "library"
+    lib.mkdir()
+    root = make_root_library(lib, version=203)      # Serato 5.0.0: the version fix-paths was checked on
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: lib)
+    monkeypatch.setattr(fix_paths, "is_serato_running", lambda: False)
+    return root
 
 
-def _insert_container_asset(conn, container_id, asset_id):
-    conn.execute(
-        "INSERT INTO container_asset (container_id, asset_id) VALUES (?, ?)",
-        (container_id, asset_id),
-    )
+def _seed(root, tracks=(), crates=(), members=()):
+    """tracks: (asset id, portable_id). crates: (container id, name).
+    members: (container id, asset id, list_order). A track's space_asset id is 1000 + its id."""
+    conn = sqlite3.connect(root)
+    for asset_id, pid in tracks:
+        conn.execute("INSERT INTO asset (id, revision, portable_id, file_name) VALUES (?, 1, ?, ?)",
+                     (asset_id, pid, pid.rsplit("/", 1)[-1]))
+        conn.execute("INSERT INTO space_asset (id, asset_id, space_id) VALUES (?, ?, 2)",
+                     (1000 + asset_id, asset_id))
+    for cid, name in crates:
+        conn.execute("INSERT INTO container (id, revision, parent_id, name, type, list_order, space_id) "
+                     "VALUES (?, 1, 3, ?, 1, ?, 2)", (cid, name, cid))
+    for cid, asset_id, order in members:
+        conn.execute("INSERT INTO container_asset (revision, container_id, space_asset_id, list_order) "
+                     "VALUES (1, ?, ?, ?)", (cid, 1000 + asset_id, order))
+    conn.commit()
+    conn.close()
 
 
-def _write_csv(path: Path, rows: list[dict]) -> None:
+def _fixes(tmp_path, rows):
+    """Write a path-fixes.csv. rows: (old path, proposed path, confidence)."""
+    path = tmp_path / "path-fixes.csv"
     with path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(
-            f,
-            fieldnames=[
-                "asset_id", "location_id", "old_portable_id",
-                "proposed_new_portable_id", "confidence",
-                "candidate_count", "alternate_paths",
-                "file_size_db", "file_name", "artist", "name",
-            ],
-        )
-        w.writeheader()
-        for r in rows:
-            w.writerow({**{k: "" for k in w.fieldnames}, **r})
+        w = csv.writer(f)
+        w.writerow(CSV_COLUMNS)
+        for n, (old, new, confidence) in enumerate(rows, 1):
+            w.writerow([9000 + n, 1, old, new, confidence])     # the id is master.sqlite's: not used
+    return path
 
 
-def test_get_asset_referencing_columns_finds_cascade_fk():
-    conn = _connect_with_schema()
-    refs = get_asset_referencing_columns(conn)
-    # In the idealised schema both formal-FK columns are CASCADE.
-    by_table = {(t, c): cascade for (t, c, cascade) in refs}
-    assert by_table[("container_asset", "asset_id")] is True
-    conn.close()
+def _run(csv_path, apply=True, **flags):
+    options = {"keep_orphans": False, "ambiguous_too": False, "repair_only": False,
+               "audit_log_path": None, "assume_yes": True, **flags}
+    return run_fix_paths(csv_path, apply=apply, **options)
 
 
-def test_pure_update_when_proposed_path_is_unclaimed(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/new/song.mp3",
-        "confidence": "auto",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.updated == 1
-    assert stats.merged == 0
-    row = conn.execute("SELECT portable_id FROM asset WHERE id = 1").fetchone()
-    assert row["portable_id"] == "music/new/song.mp3"
-    conn.close()
+def _paths(root):
+    conn = sqlite3.connect(root)
+    try:
+        return sorted(r[0] for r in conn.execute("SELECT portable_id FROM asset"))
+    finally:
+        conn.close()
 
 
-def test_merge_reparents_membership_then_deletes_broken(tmp_path):
-    conn = _connect_with_schema()
-    # Healthy + broken assets, same location
-    _insert_asset(conn, 1, 1, "music/healthy/song.mp3")
-    _insert_asset(conn, 2, 1, "music/broken/song.mp3")
-    # Two crates
-    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate A')")
-    conn.execute("INSERT INTO container (id, name) VALUES (11, 'Crate B')")
-    # Broken belongs to A and B; healthy belongs to A only.
-    # After merge: healthy should belong to A and B; broken should be gone.
-    _insert_container_asset(conn, 10, 1)  # healthy in A
-    _insert_container_asset(conn, 10, 2)  # broken in A — conflict, will be cascade-deleted
-    _insert_container_asset(conn, 11, 2)  # broken in B — should re-parent to healthy
-
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "2", "location_id": "1",
-        "old_portable_id": "music/broken/song.mp3",
-        "proposed_new_portable_id": "music/healthy/song.mp3",
-        "confidence": "auto",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.merged == 1
-    # Broken row gone
-    assert conn.execute("SELECT COUNT(*) FROM asset WHERE id = 2").fetchone()[0] == 0
-    # Healthy row now belongs to both crates
-    healthy_crates = sorted(
-        r["container_id"] for r in conn.execute(
-            "SELECT container_id FROM container_asset WHERE asset_id = 1"
-        )
-    )
-    assert healthy_crates == [10, 11]
-    # No dangling membership rows
-    total = conn.execute("SELECT COUNT(*) FROM container_asset").fetchone()[0]
-    assert total == 2
-    conn.close()
+def _members(root, container_id):
+    """(asset id, list_order) of each track in a crate."""
+    conn = sqlite3.connect(root)
+    try:
+        return sorted(conn.execute(
+            "SELECT sa.asset_id, ca.list_order FROM container_asset ca "
+            "JOIN space_asset sa ON sa.id = ca.space_asset_id WHERE ca.container_id = ?", (container_id,)))
+    finally:
+        conn.close()
 
 
-def test_orphan_deleted_by_default(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/gone/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/gone/song.mp3",
-        "proposed_new_portable_id": "",
-        "confidence": "orphan",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.orphans_deleted == 1
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 0
-    conn.close()
+def _one(root, sql, *args):
+    conn = sqlite3.connect(root)
+    try:
+        return conn.execute(sql, args).fetchone()[0]
+    finally:
+        conn.close()
 
 
-def test_orphan_kept_when_flag_set(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/gone/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/gone/song.mp3",
-        "proposed_new_portable_id": "",
-        "confidence": "orphan",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=True, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.skipped_keep_orphans == 1
-    assert stats.orphans_deleted == 0
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 1
-    conn.close()
+# ---- the three repairs
 
 
-def test_ambiguous_skipped_by_default(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    _insert_asset(conn, 2, 1, "music/healthy/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/healthy/song.mp3",
-        "confidence": "ambiguous",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.skipped_ambiguous == 1
-    # Both assets still present
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 2
-    conn.close()
+def test_update_changes_the_path_and_tells_serato(library, tmp_path):
+    """The new path has no entry: the entry's path and file name change, the row is
+    stamped with the new revision, and the library's revision numbers go up."""
+    _seed(library, tracks=[(1, "Users/x/old/song.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old/song.mp3", "Users/x/new/renamed.mp3", "auto")])
+    audit = tmp_path / "audit.csv"
+    assert _run(fixes, audit_log_path=audit) == 0
+    assert _paths(library) == ["Users/x/new/renamed.mp3"]
+    assert _one(library, "SELECT file_name FROM asset WHERE id = 1") == "renamed.mp3"
+    assert _one(library, "SELECT revision FROM asset WHERE id = 1") == 101
+    assert _one(library, "SELECT revision FROM serato") == 101
+    assert _one(library, "SELECT revision FROM master") == 101
+    assert _one(library, "SELECT revision FROM space WHERE id = 2") == 101
+    assert [r["action"] for r in csv.DictReader(audit.open())] == ["updated"]
 
 
-def test_ambiguous_applied_when_flag_set(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    _insert_asset(conn, 2, 1, "music/healthy/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/healthy/song.mp3",
-        "confidence": "ambiguous",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=True,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.merged == 1
-    conn.close()
+def test_merge_moves_crate_memberships_to_the_kept_copy(library, tmp_path):
+    """The new path already has an entry. The spare is in crates A and B, the kept copy in
+    A only. Afterwards the kept copy is in both, once each, in the spare's place in B."""
+    _seed(library,
+          tracks=[(1, "Users/x/kept.flac"), (2, "Users/x/spare.flac"), (3, "Users/x/other.flac")],
+          crates=[(10, "A"), (11, "B")],
+          members=[(10, 1, 1), (10, 2, 2), (11, 3, 1), (11, 2, 7)])
+    fixes = _fixes(tmp_path, [("Users/x/spare.flac", "Users/x/kept.flac", "auto")])
+    assert _run(fixes) == 0
+    assert _paths(library) == ["Users/x/kept.flac", "Users/x/other.flac"]      # the spare is gone
+    assert _members(library, 10) == [(1, 1)]                 # not added a second time
+    assert _members(library, 11) == [(1, 7), (3, 1)]         # moved, and it kept its place
+    assert _one(library, "SELECT COUNT(*) FROM space_asset WHERE asset_id = 2") == 0
+    assert _one(library, "SELECT COUNT(*) FROM container_asset "
+                         "WHERE space_asset_id NOT IN (SELECT id FROM space_asset)") == 0
+    assert _one(library, "SELECT revision FROM container_asset WHERE container_id = 11 "
+                         "AND space_asset_id = 1001") == 101
+    assert _one(library, "SELECT revision FROM space WHERE id = 2") == 101
 
 
-def test_repair_only_skips_merges(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    _insert_asset(conn, 2, 1, "music/healthy/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/healthy/song.mp3",
-        "confidence": "auto",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=True, audit_log_path=None,
-    )
-
-    assert stats.skipped_repair_only_merge == 1
-    assert stats.merged == 0
-    # Both assets still present
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 2
-    conn.close()
+def test_two_spares_of_one_track_in_one_crate(library, tmp_path, capsys):
+    """Two spares in the same crate merge into one kept copy: the crate gets the kept
+    copy once. The dry run counts one moved membership, as the write does."""
+    _seed(library,
+          tracks=[(1, "Users/x/kept.flac"), (2, "Users/x/spare a.flac"), (3, "Users/x/spare b.flac")],
+          crates=[(10, "A")], members=[(10, 2, 1), (10, 3, 2)])
+    fixes = _fixes(tmp_path, [("Users/x/spare a.flac", "Users/x/kept.flac", "auto"),
+                              ("Users/x/spare b.flac", "Users/x/kept.flac", "auto")])
+    assert _run(fixes, apply=False) == 0
+    assert "crate memberships moved:               1" in capsys.readouterr().out
+    assert _run(fixes) == 0
+    assert "crate memberships moved:               1" in capsys.readouterr().out
+    assert _members(library, 10) == [(1, 1)]
 
 
-def test_dry_run_writes_nothing(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/new/song.mp3",
-        "confidence": "auto",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=False, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.updated == 1
-    # But the database is unchanged
-    row = conn.execute("SELECT portable_id FROM asset WHERE id = 1").fetchone()
-    assert row["portable_id"] == "music/old/song.mp3"
-    conn.close()
+def test_orphan_is_deleted_with_its_memberships(library, tmp_path):
+    _seed(library, tracks=[(1, "Users/x/gone.mp3"), (2, "Users/x/here.mp3")],
+          crates=[(10, "A")], members=[(10, 1, 1), (10, 2, 2)])
+    fixes = _fixes(tmp_path, [("Users/x/gone.mp3", "", "orphan")])
+    assert _run(fixes) == 0
+    assert _paths(library) == ["Users/x/here.mp3"]
+    assert _members(library, 10) == [(2, 2)]
 
 
-def test_skips_stale_csv_row(tmp_path):
-    conn = _connect_with_schema()
-    # Asset's actual portable_id differs from the CSV's old_portable_id
-    _insert_asset(conn, 1, 1, "music/already/moved.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/old/song.mp3",  # stale
-        "proposed_new_portable_id": "music/new/song.mp3",
-        "confidence": "auto",
-    }])
-
-    stats = apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    assert stats.skipped_stale_csv == 1
-    assert stats.updated == 0
-    conn.close()
+@pytest.mark.parametrize("flag", ["keep_orphans", "repair_only"])
+def test_orphan_is_kept_when_asked(library, tmp_path, flag):
+    """--keep-orphans keeps it. So does --repair-only, which promises path changes only."""
+    _seed(library, tracks=[(1, "Users/x/gone.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/gone.mp3", "", "orphan")])
+    assert _run(fixes, **{flag: True}) == 0
+    assert _paths(library) == ["Users/x/gone.mp3"]
+    assert _one(library, "SELECT revision FROM serato") == 100          # nothing was written
 
 
-def test_audit_log_records_actions(tmp_path):
-    conn = _connect_with_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    _insert_asset(conn, 2, 1, "music/gone/song.mp3")
-    csv_path = tmp_path / "fixes.csv"
-    audit_path = tmp_path / "audit.csv"
-    _write_csv(csv_path, [
-        {"asset_id": "1", "location_id": "1",
-         "old_portable_id": "music/old/song.mp3",
-         "proposed_new_portable_id": "music/new/song.mp3",
-         "confidence": "auto"},
-        {"asset_id": "2", "location_id": "1",
-         "old_portable_id": "music/gone/song.mp3",
-         "proposed_new_portable_id": "",
-         "confidence": "orphan"},
+# ---- the rows it must leave alone
+
+
+def test_rows_that_are_skipped(library, tmp_path, capsys):
+    _seed(library, tracks=[(1, "Users/x/a.mp3"), (2, "Users/x/b.mp3"), (3, "Users/x/c.mp3"),
+                           (4, "Users/x/d.mp3"), (5, "Users/x/kept.mp3")])
+    fixes = _fixes(tmp_path, [
+        ("Users/x/a.mp3", "Users/x/a2.mp3", "ambiguous"),       # needs --ambiguous-too
+        ("Users/x/b.mp3", "Users/x/b2.mp3", "probably"),        # a confidence it does not know
+        ("Users/x/c.mp3", "", "auto"),                          # no proposed path
+        ("streaming:tidal/12345", "", "orphan"),                # not an entry of root.sqlite
+        ("Users/x/d.mp3", "Users/x/kept.mp3", "auto"),          # a merge, under --repair-only
     ])
-
-    apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=audit_path,
-    )
-
-    rows = list(csv.DictReader(audit_path.open()))
-    actions = {r["asset_id"]: r["action"] for r in rows}
-    assert actions == {"1": "updated", "2": "orphan_deleted"}
-    conn.close()
-
-
-# ---------------------------------------------------------------------------
-# Informal-FK scenario — mirrors the real Serato schema where some tables have
-# an `asset_id` column with no foreign key. Without explicit cleanup, deleting
-# from `asset` leaves dangling rows that crash Serato's library scan.
-# Schema lives in tests/_schemas.py and is reused by smoke tests.
-# ---------------------------------------------------------------------------
+    before = _paths(library)
+    assert _run(fixes, repair_only=True) == 0
+    assert _paths(library) == before
+    out = capsys.readouterr().out
+    for line in ("skipped (ambiguous):                     1", "skipped (unknown confidence):            1",
+                 "skipped (no proposed path):              1", "skipped (not in root.sqlite):            1",
+                 "skipped (repair-only blocked merge):     1"):
+        assert line in out
+    assert "FIX-PATHS NOTHING TO WRITE" in out and "no backup was made" in out
+    assert list(library.parent.glob("*.BACKUP.*")) == []
 
 
-def _connect_informal_schema():
-    conn = sqlite3.connect(":memory:", isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(INFORMAL_SCHEMA)
-    return conn
-
-
-def test_referencing_columns_distinguishes_cascade_from_informal():
-    conn = _connect_informal_schema()
-    refs = get_asset_referencing_columns(conn)
-    by_table = {(t, c): cascade for (t, c, cascade) in refs}
-    assert by_table[("selection_asset", "asset_id")] is True
-    assert by_table[("container_asset", "asset_id")] is False
-    conn.close()
-
-
-def test_orphan_delete_cleans_up_informal_references(tmp_path):
-    conn = _connect_informal_schema()
-    _insert_asset(conn, 1, 1, "music/gone/song.mp3")
-    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
-    _insert_container_asset(conn, 10, 1)
-
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "1", "location_id": "1",
-        "old_portable_id": "music/gone/song.mp3",
-        "proposed_new_portable_id": "",
-        "confidence": "orphan",
-    }])
-
-    apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    # No dangling container_asset row left behind
-    dangling = conn.execute(
-        "SELECT COUNT(*) FROM container_asset "
-        "WHERE asset_id NOT IN (SELECT id FROM asset)"
-    ).fetchone()[0]
-    assert dangling == 0
-    conn.close()
-
-
-def test_merge_cleans_up_informal_conflict_rows(tmp_path):
-    conn = _connect_informal_schema()
-    _insert_asset(conn, 1, 1, "music/healthy/song.mp3")
-    _insert_asset(conn, 2, 1, "music/broken/song.mp3")
-    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate A')")
-    conn.execute("INSERT INTO container (id, name) VALUES (11, 'Crate B')")
-    # Both broken and healthy in Crate A — UPDATE OR IGNORE will skip the
-    # broken row in A. Without explicit cleanup, that row would dangle when
-    # we delete the broken asset.
-    _insert_container_asset(conn, 10, 1)  # healthy in A
-    _insert_container_asset(conn, 10, 2)  # broken in A — conflict
-    _insert_container_asset(conn, 11, 2)  # broken in B — re-parents cleanly
-
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, [{
-        "asset_id": "2", "location_id": "1",
-        "old_portable_id": "music/broken/song.mp3",
-        "proposed_new_portable_id": "music/healthy/song.mp3",
-        "confidence": "auto",
-    }])
-
-    apply_fixes(
-        conn, csv_path,
-        apply=True, keep_orphans=False, ambiguous_too=False,
-        repair_only=False, audit_log_path=None,
-    )
-
-    # Healthy row now lives in both crates
-    healthy_crates = sorted(
-        r["container_id"] for r in conn.execute(
-            "SELECT container_id FROM container_asset WHERE asset_id = 1"
-        )
-    )
-    assert healthy_crates == [10, 11]
-    # No dangling rows
-    dangling = conn.execute(
-        "SELECT COUNT(*) FROM container_asset "
-        "WHERE asset_id NOT IN (SELECT id FROM asset)"
-    ).fetchone()[0]
-    assert dangling == 0
-    conn.close()
-
-
-def test_backup_serato_library_creates_readable_copy(tmp_path):
-    src = tmp_path / "master.sqlite"
-    conn = sqlite3.connect(str(src))
-    conn.execute("CREATE TABLE asset (id INTEGER PRIMARY KEY, portable_id TEXT)")
-    conn.execute("INSERT INTO asset VALUES (1, 'music/x.mp3')")
+def test_a_new_path_held_outside_the_library_is_left_alone(library, tmp_path, capsys):
+    """The new path belongs to an entry of another space. A path is unique in root.sqlite,
+    so writing it would fail and take every other repair of the run down with it. The row
+    is skipped, and the other row of the run is still written."""
+    _seed(library, tracks=[(1, "Users/x/old.mp3"), (2, "Users/x/other old.mp3")])
+    conn = sqlite3.connect(library)
+    conn.execute("INSERT INTO space (id, name, revision) VALUES (3, 'Prepare', 100)")
+    conn.execute("INSERT INTO asset (id, revision, portable_id) VALUES (9, 1, 'Users/x/Taken.mp3')")
+    conn.execute("INSERT INTO space_asset (id, asset_id, space_id) VALUES (1009, 9, 3)")
     conn.commit()
     conn.close()
-
-    backup = backup_serato_library(src)
-    assert backup.exists()
-    # Backup is a valid SQLite DB with the same row
-    bconn = sqlite3.connect(str(backup))
-    row = bconn.execute("SELECT portable_id FROM asset WHERE id = 1").fetchone()
-    assert row[0] == "music/x.mp3"
-    bconn.close()
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/taken.mp3", "auto"),
+                              ("Users/x/other old.mp3", "Users/x/other new.mp3", "auto")])
+    assert _run(fixes) == 0
+    assert _paths(library) == ["Users/x/Taken.mp3", "Users/x/old.mp3", "Users/x/other new.mp3"]
+    assert "skipped (new path held outside the library): 1" in capsys.readouterr().out
 
 
-# ---------------------------------------------------------------------------
-# The skips that had no test, on INFORMAL_SCHEMA as CONTRIBUTING.md asks.
-# ---------------------------------------------------------------------------
+def test_ambiguous_is_applied_when_asked(library, tmp_path):
+    _seed(library, tracks=[(1, "Users/x/a.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/a.mp3", "Users/x/a2.mp3", "ambiguous")])
+    assert _run(fixes, ambiguous_too=True) == 0
+    assert _paths(library) == ["Users/x/a2.mp3"]
 
 
-def _apply(conn, tmp_path, rows, **flags):
-    csv_path = tmp_path / "fixes.csv"
-    _write_csv(csv_path, rows)
-    options = {"apply": True, "keep_orphans": False, "ambiguous_too": False,
-               "repair_only": False, "audit_log_path": None, **flags}
-    return apply_fixes(conn, csv_path, **options)
+def test_a_path_is_found_in_another_unicode_form_or_case(library, tmp_path):
+    """root.sqlite holds the name decomposed and the CSV has it composed, with other ASCII
+    case. It is one entry. The kept copy is matched the same way, so this is a merge."""
+    nfd = unicodedata.normalize("NFD", "Users/x/Zéro spare.flac")
+    _seed(library, tracks=[(1, nfd), (2, unicodedata.normalize("NFD", "Users/x/Zéro.flac"))],
+          crates=[(10, "A")], members=[(10, 1, 1)])
+    fixes = _fixes(tmp_path, [(unicodedata.normalize("NFC", "users/X/Zéro spare.flac"),
+                               unicodedata.normalize("NFC", "Users/x/Zéro.flac"), "auto")])
+    assert _run(fixes) == 0
+    assert _one(library, "SELECT COUNT(*) FROM asset") == 1
+    assert _members(library, 10) == [(2, 1)]
 
 
-def test_unknown_confidence_is_skipped(tmp_path):
-    """A confidence value fix-paths does not know is never applied as a repair."""
-    conn = _connect_informal_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    stats = _apply(conn, tmp_path, [{
-        "asset_id": "1", "location_id": "1", "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "music/new/song.mp3", "confidence": "probably",
-    }])
-    assert stats.skipped_unknown_confidence == 1
-    assert conn.execute("SELECT portable_id FROM asset").fetchone()[0] == "music/old/song.mp3"
+def test_a_rename_in_case_or_form_only_is_an_update_of_the_same_entry(library, tmp_path):
+    """The new path is the old one in another letter case and Unicode form. The entry it
+    'already has' is this entry: a path change, never a merge of the entry into itself."""
+    old = unicodedata.normalize("NFD", "Users/x/zéro.flac")
+    new = unicodedata.normalize("NFC", "Users/x/Zéro.flac")
+    _seed(library, tracks=[(1, old)], crates=[(10, "A")], members=[(10, 1, 1)])
+    assert _run(_fixes(tmp_path, [(old, new, "auto")])) == 0
+    assert _paths(library) == [new]
+    assert _members(library, 10) == [(1, 1)]
 
 
-def test_row_without_a_proposal_is_skipped(tmp_path):
-    """An auto row with an empty proposed path must not blank the stored path."""
-    conn = _connect_informal_schema()
-    _insert_asset(conn, 1, 1, "music/old/song.mp3")
-    stats = _apply(conn, tmp_path, [{
-        "asset_id": "1", "location_id": "1", "old_portable_id": "music/old/song.mp3",
-        "proposed_new_portable_id": "", "confidence": "auto",
-    }])
-    assert stats.skipped_no_proposal == 1
-    assert conn.execute("SELECT portable_id FROM asset").fetchone()[0] == "music/old/song.mp3"
+def test_a_later_row_sees_what_an_earlier_row_did(library, tmp_path):
+    """Row 1 moves an entry to a new path. Row 2's new path is that same path: it is taken
+    now, so row 2 is a merge into the moved entry, with its crate membership."""
+    _seed(library, tracks=[(1, "Users/x/first.flac"), (2, "Users/x/second.flac")],
+          crates=[(10, "A")], members=[(10, 2, 4)])
+    fixes = _fixes(tmp_path, [("Users/x/first.flac", "Users/x/kept.flac", "auto"),
+                              ("Users/x/second.flac", "Users/x/kept.flac", "auto")])
+    assert _run(fixes) == 0
+    assert _paths(library) == ["Users/x/kept.flac"]
+    assert _members(library, 10) == [(1, 4)]
 
 
-def test_repair_only_keeps_orphans(tmp_path):
-    """--repair-only promises path UPDATEs only, so it deletes nothing."""
-    conn = _connect_informal_schema()
-    _insert_asset(conn, 1, 1, "music/gone/song.mp3")
-    stats = _apply(conn, tmp_path, [{
-        "asset_id": "1", "location_id": "1", "old_portable_id": "music/gone/song.mp3",
-        "proposed_new_portable_id": "", "confidence": "orphan",
-    }], repair_only=True)
-    assert stats.orphans_deleted == 0
-    assert stats.skipped_keep_orphans == 1
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 1
+def test_dry_run_decides_the_same_and_writes_nothing(library, tmp_path, capsys):
+    _seed(library, tracks=[(1, "Users/x/kept.flac"), (2, "Users/x/spare.flac"), (3, "Users/x/gone.mp3"),
+                           (4, "Users/x/old.mp3")],
+          crates=[(10, "A")], members=[(10, 2, 1)])
+    fixes = _fixes(tmp_path, [("Users/x/spare.flac", "Users/x/kept.flac", "auto"),
+                              ("Users/x/gone.mp3", "", "orphan"),
+                              ("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    report = tmp_path / "fix-paths-dry-run.csv"
+    before = library.read_bytes()
+    assert _run(fixes, apply=False, audit_log_path=report) == 0
+    assert library.read_bytes() == before
+    assert list(library.parent.glob("*.BACKUP.*")) == []
+    out = capsys.readouterr().out
+    assert "FIX-PATHS DRY-RUN" in out
+    assert "crate memberships moved:               1" in out
+    assert [r["action"] for r in csv.DictReader(report.open())] == ["merged", "orphan_deleted", "updated"]
 
 
-# ---------------------------------------------------------------------------
-# Serato's real column and foreign-key shape (MASTER_SHAPE_SCHEMA).
-# ---------------------------------------------------------------------------
+# ---- the safety rules of a run that writes
 
 
-def _connect_master_shape():
-    conn = sqlite3.connect(":memory:", isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    conn.executescript(MASTER_SHAPE_SCHEMA)
-    conn.execute("INSERT INTO space (id, name) VALUES (2, 'Serato Library')")
-    conn.execute("INSERT INTO container (id, name) VALUES (100, 'Crate A')")
-    conn.execute("INSERT INTO location_container (id, container_id, location_id) VALUES (200, 100, 1)")
-    return conn
+def test_backs_up_the_three_files_before_it_writes(library, tmp_path):
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    assert _run(fixes) == 0
+    backup = next(library.parent.glob("root.sqlite.BACKUP.*"))
+    assert _paths(backup) == ["Users/x/old.mp3"]                          # the state before the write
+    manifest = next((library.parent / serato_db.MANIFEST_DIRNAME).glob("manifest.json.BACKUP.*"))
+    assert json.loads(manifest.read_text()) == {"version": 1, "roots": {}}
 
 
-def _insert_library_asset(conn, asset_id, portable_id):
-    """An asset in the Serato Library space, as every real track is."""
-    _insert_asset(conn, asset_id, 1, portable_id)
-    conn.execute("INSERT INTO space_asset (id, asset_id, space_id) VALUES (?, ?, 2)",
-                 (10 + asset_id, asset_id))
+def test_a_write_asks_first(library, tmp_path, monkeypatch):
+    """A write deletes library entries, so it asks, as a removal in sync does. With nobody
+    to ask it is refused with exit code 1. A no writes nothing; a yes writes."""
+    import builtins
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+
+    monkeypatch.setattr(fix_paths.sys.stdin, "isatty", lambda: False)
+    assert _run(fixes, assume_yes=False) == 1
+    assert _paths(library) == ["Users/x/old.mp3"]
+    assert list(library.parent.glob("*.BACKUP.*")) == []
+
+    monkeypatch.setattr(fix_paths.sys.stdin, "isatty", lambda: True)
+    monkeypatch.setattr(builtins, "input", lambda prompt: "n")
+    assert _run(fixes, assume_yes=False) == 0
+    assert _paths(library) == ["Users/x/old.mp3"]
+    assert list(library.parent.glob("*.BACKUP.*")) == []
+
+    monkeypatch.setattr(builtins, "input", lambda prompt: "y")
+    assert _run(fixes, assume_yes=False) == 0
+    assert _paths(library) == ["Users/x/new.mp3"]
 
 
-def test_orphan_delete_keeps_play_history(tmp_path):
-    """history_entry.asset_id is ON DELETE SET NULL in Serato: the history row of a
-    deleted track stays, with no track. fix-paths must not delete it by hand."""
-    conn = _connect_master_shape()
-    _insert_library_asset(conn, 1, "music/gone/song.mp3")
-    conn.execute("INSERT INTO history_entry (id, asset_id) VALUES (7, 1)")
-    refs = {(t, c): fk for t, c, fk in get_asset_referencing_columns(conn)}
-    assert refs[("history_entry", "asset_id")] is True      # the engine's to handle
-    assert refs[("container_asset", "asset_id")] is False   # ours to clean up
-
-    _apply(conn, tmp_path, [{
-        "asset_id": "1", "location_id": "1", "old_portable_id": "music/gone/song.mp3",
-        "proposed_new_portable_id": "", "confidence": "orphan",
-    }])
-    assert conn.execute("SELECT COUNT(*) FROM asset").fetchone()[0] == 0
-    assert conn.execute("SELECT asset_id FROM history_entry WHERE id = 7").fetchone()[0] is None
+def test_refuses_while_serato_runs(library, tmp_path, monkeypatch):
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    monkeypatch.setattr(fix_paths, "is_serato_running", lambda: True)
+    assert _run(fixes) == 1
+    assert _paths(library) == ["Users/x/old.mp3"]
+    assert list(library.parent.glob("*.BACKUP.*")) == []
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Known fault, measured on 27 November 2026: on Serato's real shape a merge drops the "
-    "broken row's crate memberships. The kept copy already has a space_asset, so the broken "
-    "row's space_asset is not re-parented, and deleting the broken asset cascades through it "
-    "to the container_asset rows. fix-paths --apply is refused on every library with a "
-    "root.sqlite, so this cannot reach a real library today. Remove this mark when the merge "
-    "points container_asset.space_asset_id at the kept copy's space_asset."))
-def test_merge_moves_memberships_on_the_real_shape(tmp_path):
-    conn = _connect_master_shape()
-    _insert_library_asset(conn, 1, "music/kept.flac")
-    _insert_library_asset(conn, 2, "music/spare.flac")
-    conn.execute("INSERT INTO container_asset (asset_id, location_container_id, space_asset_id, list_order) "
-                 "VALUES (2, 200, 12, 1)")                    # the spare is in Crate A
-    _apply(conn, tmp_path, [{
-        "asset_id": "2", "location_id": "1", "old_portable_id": "music/spare.flac",
-        "proposed_new_portable_id": "music/kept.flac", "confidence": "auto",
-    }])
-    assert conn.execute("SELECT COUNT(*) FROM container_asset WHERE asset_id = 1").fetchone()[0] == 1
-
-
-def test_backup_refuses_a_copy_that_fails_integrity_check(tmp_path):
-    """The snapshot is checked before any write. Here the index is made to disagree
-    with its table, which the Backup API copies page for page."""
-    src = tmp_path / "master.sqlite"
-    conn = sqlite3.connect(str(src))
-    conn.execute("CREATE TABLE asset (id INTEGER PRIMARY KEY, a TEXT, b TEXT)")
-    conn.execute("CREATE INDEX asset_a ON asset (a)")
-    conn.executemany("INSERT INTO asset (a, b) VALUES (?, ?)", [("x", "2"), ("y", "1")])
-    conn.commit()
-    conn.execute("PRAGMA writable_schema = ON")
-    conn.execute("UPDATE sqlite_master SET sql = 'CREATE INDEX asset_a ON asset (b)' WHERE name = 'asset_a'")
-    conn.commit()
+@pytest.mark.parametrize("version", [202, 204])
+def test_refuses_a_schema_version_not_checked(library, tmp_path, capsys, version):
+    """What fix-paths writes was checked on schema version 203 only. 202 (Serato 4.x) is
+    one sync was checked on, and that says nothing about these writes: refused too.
+    A dry run works and says what --apply would do. --apply writes nothing."""
+    assert fix_paths.CHECKED_SCHEMA_VERSIONS == frozenset({203})
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    conn = sqlite3.connect(library)
+    conn.execute(f"PRAGMA user_version = {version}")
     conn.close()
-    with pytest.raises(RuntimeError, match="integrity_check failed"):
-        backup_serato_library(src)
-    assert list(tmp_path.glob("master.sqlite.BACKUP.*")) == []     # a failed snapshot is not kept
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    assert _run(fixes, apply=False) == 0
+    assert f"With --apply this is refused: root.sqlite is at schema version {version}" in capsys.readouterr().out
+    assert _run(fixes) == 1
+    assert _paths(library) == ["Users/x/old.mp3"]
+    assert list(library.parent.glob("*.BACKUP.*")) == []
 
 
-def test_backup_that_cannot_be_checked_is_not_left_behind(tmp_path):
-    """Serato 5.0's master.sqlite: integrity_check raises for want of Serato's own
-    collation. The snapshot is as big as the library, so it must not stay."""
-    src = tmp_path / "master.sqlite"
-    conn = sqlite3.connect(str(src))
-    conn.create_collation("serato_asset_string_comparator", lambda a, b: (a > b) - (a < b))
-    conn.execute("CREATE TABLE anonymous_table_0 (asset_id INTEGER PRIMARY KEY, primary_sort TEXT)")
-    conn.execute("CREATE INDEX anonymous_index_19 ON anonymous_table_0 "
-                 "( primary_sort COLLATE serato_asset_string_comparator ASC )")
-    conn.commit()
-    conn.close()
-    with pytest.raises(sqlite3.OperationalError, match="no such collation sequence"):
-        backup_serato_library(src)
-    assert list(tmp_path.glob("master.sqlite.BACKUP.*")) == []
+def test_refuses_a_folder_with_no_root_sqlite(tmp_path, monkeypatch):
+    empty = tmp_path / "not a library"
+    empty.mkdir()
+    monkeypatch.setattr(serato_db, "get_serato_library_dir", lambda: empty)
+    monkeypatch.setattr(fix_paths, "is_serato_running", lambda: False)
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    assert _run(fixes) == 1
+    assert _run(fixes, apply=False) == 1
+    assert list(empty.iterdir()) == []
+
+
+def test_rolls_back_when_the_check_fails(library, tmp_path, monkeypatch):
+    """The checks run inside the transaction. A failure leaves root.sqlite as it was,
+    leaves no audit log, and gives exit code 1."""
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    audit = tmp_path / "audit.csv"
+
+    def fail(conn, **kwargs):
+        raise sqlite3.IntegrityError("foreign_key_check failed: test")
+    monkeypatch.setattr(fix_paths, "validate_integrity", fail)
+    assert _run(fixes, audit_log_path=audit) == 1
+    assert _paths(library) == ["Users/x/old.mp3"]
+    assert _one(library, "SELECT revision FROM serato") == 100
+    assert not audit.exists()
+    assert not audit.with_name(audit.name + ".inprogress").exists()
+
+
+def test_killed_run_leaves_no_audit_log(library, tmp_path, monkeypatch):
+    """Stopped part-way through the write (Ctrl-C): nothing is committed and the audit
+    log is not at its final path."""
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    audit = tmp_path / "audit.csv"
+    real = fix_paths._process_fix_row
+
+    def stop_when_writing(conn, row, *args, apply, **kwargs):
+        if apply:
+            raise KeyboardInterrupt
+        return real(conn, row, *args, apply=apply, **kwargs)
+    monkeypatch.setattr(fix_paths, "_process_fix_row", stop_when_writing)
+    with pytest.raises(KeyboardInterrupt):
+        _run(fixes, audit_log_path=audit)
+    assert not audit.exists()
+    assert _paths(library) == ["Users/x/old.mp3"]
+
+
+def test_a_file_that_is_not_a_path_fixes_csv_is_refused(library, tmp_path, capsys):
+    bad = tmp_path / "other.csv"
+    bad.write_text("id,path\n1,Users/x/old.mp3\n", encoding="utf-8")
+    assert _run(bad) == 1
+    assert list(library.parent.glob("*.BACKUP.*")) == []
+
+
+def test_old_backups_go_after_a_write_that_succeeded(library, tmp_path):
+    """The retention rule of sync applies here too: the tool's own older backups go."""
+    lib = library.parent
+    old = [lib / f"root.sqlite.BACKUP.2020010{n}_000000" for n in (1, 2, 3)]
+    for f in old:
+        f.write_bytes(b"old")
+    _seed(library, tracks=[(1, "Users/x/old.mp3")])
+    fixes = _fixes(tmp_path, [("Users/x/old.mp3", "Users/x/new.mp3", "auto")])
+    assert _run(fixes, keep_backups=2) == 0
+    assert [f.exists() for f in old] == [False, False, True]

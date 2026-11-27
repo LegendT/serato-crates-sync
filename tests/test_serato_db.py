@@ -5,10 +5,11 @@ constraint, and foreign keys) and exercises the additive mirror against a
 real on-disk folder tree.
 
 The fixture is cut down from the real schema (version 202, Serato 4.x, May
-2026). It leaves out AUTOINCREMENT, the NOCASE unique index on
-asset.portable_id, UNIQUE(asset_id, space_id), eight of the eleven triggers
-and, from version 203 (Serato 5.0), space_asset.revision. A test whose
-result depends on one of those needs it added here first.
+2026). It leaves out AUTOINCREMENT, UNIQUE(asset_id, space_id), eight of
+the eleven triggers and, from version 203 (Serato 5.0),
+space_asset.revision. A test whose result depends on one of those needs it
+added here first. tests/test_real_schema.py runs fix-paths on a real
+schema, when it is pointed at one.
 """
 import json
 import sqlite3
@@ -51,6 +52,7 @@ CREATE TABLE asset (
     time_added INTEGER NOT NULL DEFAULT 0,
     time_modified INTEGER NOT NULL DEFAULT 0
 );
+CREATE UNIQUE INDEX asset__unique_portable_id ON asset ( portable_id COLLATE NOCASE );
 CREATE TABLE space_asset (
     id INTEGER PRIMARY KEY,
     asset_id INTEGER NOT NULL,
@@ -88,13 +90,13 @@ END;
 """
 
 
-@pytest.fixture
-def root_db(tmp_path):
-    """A minimal but faithful root.sqlite with the Serato Library anchors seeded."""
-    db = tmp_path / "root.sqlite"
+def make_root_library(folder, version=202):
+    """A cut-down root.sqlite in ``folder``, with the Serato Library anchors seeded.
+    Version 202 is Serato 4.x, one of the versions the tool has been checked on."""
+    db = folder / "root.sqlite"
     conn = sqlite3.connect(db)
     conn.executescript(ROOT_SCHEMA)
-    conn.execute("PRAGMA user_version = 202")   # Serato 4.x: a version sync has been checked on
+    conn.execute(f"PRAGMA user_version = {int(version)}")
     conn.execute("INSERT INTO serato (revision) VALUES (100)")
     conn.execute("INSERT INTO master (revision) VALUES (100)")
     conn.execute("INSERT INTO space (id,name,revision) VALUES (2,'Serato Library',100)")
@@ -106,6 +108,12 @@ def root_db(tmp_path):
     conn.commit()
     conn.close()
     return db
+
+
+@pytest.fixture
+def root_db(tmp_path):
+    """A minimal root.sqlite with the Serato Library anchors seeded."""
+    return make_root_library(tmp_path)
 
 
 @pytest.fixture
