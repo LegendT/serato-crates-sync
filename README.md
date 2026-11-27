@@ -17,10 +17,9 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv               # 3. dry-
 serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply       # 4. quit Serato, then write
 ```
 
-On Serato 4.x and later, read the caution at the top of
-[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths) before you use
-`--apply`: it writes `master.sqlite` only, and on Serato 5.0 it stops
-before it changes the library.
+On Serato 4.x and later, `--apply` refuses to run, because it writes
+`master.sqlite` only. See the caution at the top of
+[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths).
 
 ## Install
 
@@ -86,10 +85,9 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply
 `fix-paths --apply` snapshots `master.sqlite` before any writes and
 runs the entire repair in a single SQLite transaction.
 
-On Serato 4.x and later, read the caution at the top of
-[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths) before you use
-`--apply`: it writes `master.sqlite` only, and on Serato 5.0 it stops
-before it changes the library.
+On Serato 4.x and later, `--apply` refuses to run, because it writes
+`master.sqlite` only. See the caution at the top of
+[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths).
 
 ## Why folder-based crates?
 

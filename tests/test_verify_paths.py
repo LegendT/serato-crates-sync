@@ -25,7 +25,7 @@ from serato_crates_sync.verify_paths import (
     verify_assets_against_filesystem,
 )
 
-from ._schemas import IDEALISED_SCHEMA
+from ._schemas import INFORMAL_SCHEMA
 
 ASSET_SCHEMA = """
 CREATE TABLE asset (
@@ -227,9 +227,12 @@ def test_load_moves_reads_the_three_shapes(tmp_path):
     bad.write_text(json.dumps([{"src": "a/relative.mp3", "dst": "/a/new.mp3"}]), encoding="utf-8")
     with pytest.raises(ValueError):
         load_moves(bad)
-    bad.write_text(json.dumps(["/a/old.mp3"]), encoding="utf-8")   # a row that is not an object
-    with pytest.raises(ValueError):
-        load_moves(bad)
+    for broken in (["/a/old.mp3"],                                  # a row that is not an object
+                   {"ops": None},                                    # ops that is not a list
+                   [{"src": 1, "dst": "/a/new.mp3"}]):               # a src that is not a string
+        bad.write_text(json.dumps(broken), encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_moves(bad)
 
 
 def test_build_filesystem_index_leaves_out_excluded_folders(tmp_path):
@@ -239,6 +242,8 @@ def test_build_filesystem_index_leaves_out_excluded_folders(tmp_path):
     (tmp_path / "_Superseded" / "Album" / "song.mp3").write_bytes(b"x")
     index = build_filesystem_index(tmp_path, DEFAULT_AUDIO_EXTENSIONS, frozenset({"_Superseded"}))
     assert [p for p, _ in index["song.mp3"]] == [str(tmp_path / "Album" / "song.mp3")]
+    index = build_filesystem_index(tmp_path, DEFAULT_AUDIO_EXTENSIONS, frozenset({"_superseded"}))
+    assert [p for p, _ in index["song.mp3"]] == [str(tmp_path / "Album" / "song.mp3")]    # any case
 
 
 def _pid(d, name):
@@ -291,7 +296,7 @@ def test_fixes_from_moves_matches_a_name_stored_in_the_other_unicode_form(tmp_pa
     assert report.to_fix == 1
 
 
-def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
+def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):    # INFORMAL_SCHEMA: the real shape
     """The rows --from-moves writes are applied by the unchanged fix-paths: a set-aside spare
     merges into the kept copy's row (crate memberships move), a renamed file's row changes path."""
     d = tmp_path / "music"
@@ -300,7 +305,7 @@ def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
     (d / "new name.flac").write_bytes(b"x")
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.row_factory = sqlite3.Row
-    conn.executescript(IDEALISED_SCHEMA)
+    conn.executescript(INFORMAL_SCHEMA)
     for i, name in ((1, "kept.flac"), (2, "spare.flac"), (3, "old name.flac")):
         conn.execute("INSERT INTO asset (id, location_id, portable_id) VALUES (?, 1, ?)", (i, _pid(d, name)))
     conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
@@ -326,9 +331,10 @@ def test_fixes_from_moves_skips_a_move_into_an_excluded_folder(tmp_path):
     (d / "_Superseded").mkdir(parents=True)
     (d / "_Superseded" / "song.flac").write_bytes(b"x")
     conn = _library([{"location_id": 1, "portable_id": str(d / "song.flac").lstrip("/"), "file_name": "song.flac"}])
-    report = fixes_from_moves(conn, [(str(d / "song.flac"), str(d / "_Superseded" / "song.flac"))], None,
-                              frozenset({"_Superseded"}))
-    assert (report.to_fix, report.excluded) == (0, 1)
+    for name in ("_Superseded", "_SUPERSEDED"):                      # any case
+        report = fixes_from_moves(conn, [(str(d / "song.flac"), str(d / "_Superseded" / "song.flac"))], None,
+                                  frozenset({name}))
+        assert (report.to_fix, report.excluded) == (0, 1)
 
 
 def test_fixes_from_moves_proposes_the_kept_rows_own_spelling(tmp_path):

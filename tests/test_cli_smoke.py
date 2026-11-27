@@ -138,7 +138,7 @@ def test_verify_paths_from_moves_smoke(monkeypatch, tmp_path):
     assert list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8"))) == []
 
 
-def test_verify_paths_exclude_smoke(monkeypatch, tmp_path):
+def test_verify_paths_exclude_smoke(monkeypatch, tmp_path, capsys):
     """--exclude through main() in search mode: an excluded folder is not indexed,
     so the only copy of the broken row's file name is not proposed."""
     import csv
@@ -156,6 +156,41 @@ def test_verify_paths_exclude_smoke(monkeypatch, tmp_path):
     assert rc == 0
     rows = list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8")))
     assert all("_Superseded" not in r["proposed_new_portable_id"] for r in rows)
+    assert "fix-paths --apply refuses" in capsys.readouterr().out     # the 4.x caution, search mode too
+
+
+def test_verify_paths_exclude_refuses_a_path(monkeypatch, tmp_path, capsys):
+    import pytest
+
+    library = tmp_path / "master.sqlite"
+    _make_real_shape_library(library)
+    with pytest.raises(SystemExit) as stop:
+        _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+                 "--music-root", str(tmp_path), "--exclude", "Music/_Superseded")
+    assert stop.value.code == 2
+    assert "folder name, not a path" in capsys.readouterr().err
+
+
+def test_fix_paths_apply_refused_beside_root_sqlite(monkeypatch, tmp_path):
+    """Serato 4.x and later: a root.sqlite beside the library stops --apply before
+    any write, even the backup; the dry run still works."""
+    music = _make_music_root(tmp_path / "music")
+    library = tmp_path / "master.sqlite"
+    _make_real_shape_library(library)
+    _seed_assets(library, music)
+    (tmp_path / "root.sqlite").write_bytes(b"")
+    csv_out = tmp_path / "diag"
+    assert _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+                    "--music-root", str(music), "--csv-out", str(csv_out)) == 0
+    before = library.read_bytes()
+    fixes = str(csv_out / "path-fixes.csv")
+
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
+                    "--from-csv", fixes, "--apply") == 1
+    assert library.read_bytes() == before
+    assert list(tmp_path.glob("master.sqlite.BACKUP.*")) == []
+    assert _run_cli(monkeypatch, "fix-paths", "--library-path", str(library),
+                    "--from-csv", fixes) == 0
 
 
 def test_fix_paths_dry_run_smoke(monkeypatch, tmp_path):

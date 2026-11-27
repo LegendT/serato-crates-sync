@@ -13,8 +13,8 @@ new path exists becomes an ``auto`` row. A search by filename cannot
 follow a rename, and can pick the wrong one of several same-named copies;
 the job's own record has neither fault.
 
-On Serato 4.x and later the rows are a list of repairs to make: see the
-caution at the top of ``fix-paths`` in docs/usage.md.
+On Serato 4.x and later nothing in this tool can apply the rows yet:
+see the caution at the top of ``fix-paths`` in docs/usage.md.
 """
 
 import csv
@@ -43,6 +43,10 @@ __all__ = [
     "fixes_from_moves",
     "print_moves_report",
 ]
+
+# Printed under every repair file, whichever mode wrote it.
+CAUTION_4X = ("On Serato 4.x and later, fix-paths --apply refuses to write these repairs: "
+              "see the caution at the top of fix-paths in docs/usage.md.")
 
 # The columns fix-paths reads. One list for both writers, so they cannot drift apart.
 FIX_COLUMNS = [
@@ -96,10 +100,11 @@ def build_filesystem_index(
 
     A size of ``-1`` means the stat failed for that entry.
 
-    Folders named in ``exclude`` are skipped at any depth: for example a
-    folder of copies set aside for deletion, which must never become the
-    target of a relink.
+    Folders named in ``exclude`` are skipped at any depth, in any case
+    (macOS volumes ignore case): for example a folder of copies set aside
+    for deletion, which must never become the target of a relink.
     """
+    excluded = {name.casefold() for name in exclude}
     index: dict[str, list[tuple[str, int]]] = {}
 
     def _walk(directory: str) -> None:
@@ -113,7 +118,7 @@ def build_filesystem_index(
                 continue
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    if entry.name not in exclude:   # a name, matched exactly
+                    if entry.name.casefold() not in excluded:
                         _walk(entry.path)
                     continue
                 if not entry.is_file(follow_symlinks=False):
@@ -323,12 +328,15 @@ def load_moves(path: Path) -> list[tuple[str, str]]:
             rows = data
     except json.JSONDecodeError:
         rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    if not isinstance(rows, list):
+        raise ValueError(f"{path}: expected a list of moves")
     pairs = []
     for n, r in enumerate(rows, 1):
         if not isinstance(r, dict):
             raise ValueError(f"{path}: move {n} is not an object with 'src' and 'dst'")
         src, dst = r.get("src"), r.get("dst")
-        if not src or not dst or not src.startswith("/") or not dst.startswith("/"):
+        if not isinstance(src, str) or not isinstance(dst, str) \
+                or not src.startswith("/") or not dst.startswith("/"):
             raise ValueError(f"{path}: move {n} needs absolute 'src' and 'dst' paths")
         pairs.append((src, dst))
     return pairs
@@ -372,6 +380,7 @@ def fixes_from_moves(
         rows.setdefault(fs_path, []).append(row)
         nfc_rows.setdefault(_nfc(fs_path), []).append(row)
 
+    excluded_names = {name.casefold() for name in exclude}
     to_fix = still = no_entry = missing = excluded = 0
     csv_file = None
     writer = None
@@ -384,7 +393,7 @@ def fixes_from_moves(
             held = rows.get(src) or nfc_rows.get(_nfc(src))
             if not held:
                 no_entry += 1
-            elif exclude and exclude.intersection(dst.split(os.sep)):
+            elif excluded_names.intersection(part.casefold() for part in dst.split(os.sep)):
                 excluded += 1
             elif os.path.exists(src):
                 still += 1
@@ -473,7 +482,7 @@ def run_verify_paths(
     if moves_path is not None:
         try:
             moves = load_moves(moves_path)
-        except (OSError, ValueError, KeyError) as e:
+        except (OSError, ValueError) as e:
             logger.error(f"Cannot read moves file: {e}")
             return 1
         csv_path = _csv_path_for(csv_out_dir)
@@ -486,7 +495,7 @@ def run_verify_paths(
         print_moves_report(report)
         if csv_path is not None:
             print(f"Repairs listed in: {csv_path}")
-            print("On Serato 4.x and later, read the caution at the top of fix-paths in docs/usage.md first.\n")
+            print(CAUTION_4X + "\n")
         return 0
     if music_root is None or not music_root.exists() or not music_root.is_dir():
         logger.error(f"Music root not found or not a directory: {music_root}")
@@ -520,5 +529,6 @@ def run_verify_paths(
 
     print_path_verification_report(report)
     if csv_path is not None:
-        print(f"Repair candidates: {csv_path}\n")
+        print(f"Repair candidates: {csv_path}")
+        print(CAUTION_4X + "\n")
     return 0
