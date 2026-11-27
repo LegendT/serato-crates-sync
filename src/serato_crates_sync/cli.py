@@ -19,10 +19,22 @@ from pathlib import Path
 from .library import (
     get_default_serato_library_path,
     get_default_serato_root,
+    is_serato_running,
     logger,
     parse_extensions,
     validate_music_root,
 )
+from .serato_db import KEEP_BACKUPS, use_library_dir
+
+
+def _keep_backups(value: str) -> int | None:
+    """--keep-backups: a number of runs from 1, or 'all' (None: remove none)."""
+    if value == "all":
+        return None
+    runs = int(value)
+    if runs < 1:
+        raise argparse.ArgumentTypeError("give a number from 1, or 'all'")
+    return runs
 
 
 def _configure_logging() -> None:
@@ -72,8 +84,13 @@ Examples:
   (on Serato 4.x and later, --apply refuses to run: see the caution in docs/usage.md)
 
 Safety:
-  - sync       : default is DRY RUN; backs up Subcrates folder; does not
-                 overwrite existing .crate files unless --overwrite.
+  - sync       : default is DRY RUN. Serato 4.x and later: backs up root.sqlite,
+                 master.sqlite and the manifest; refuses --apply while Serato is
+                 open, on a library version it has not been checked on, and for
+                 music on another drive; --prune and --clean refuse --apply on
+                 Serato 5.0 and later; keeps its newest 3 runs of backups.
+                 Serato 3.x: backs up the Subcrates folder; does not overwrite
+                 existing .crate files unless --overwrite.
   - diagnose   : read-only; safe with Serato running.
   - verify-paths: read-only; safe with Serato running.
   - fix-paths  : default is DRY RUN; with --apply, refuses to run if
@@ -118,10 +135,14 @@ Safety:
         action="store_true",
         help="Overwrite existing .crate files with same name",
     )
-    sync_parser.add_argument(
+    # One removal at a time: with both given, --clean was dropped without a word.
+    removal = sync_parser.add_mutually_exclusive_group()
+    removal.add_argument(
         "--clean",
         action="store_true",
-        help="Delete ALL existing crates before syncing (creates backup first)",
+        help="Serato 3.x: delete ALL .crate files, yours included, then sync (backup first). "
+             "Serato 4.x and later: remove every crate this tool made for the music root "
+             "and sync nothing; run sync again to write a fresh set",
     )
     sync_parser.add_argument(
         "--extensions", "-e",
@@ -158,11 +179,28 @@ Safety:
         action="store_true",
         help="Serato 4.x: skip the confirmation prompt for large writes",
     )
-    sync_parser.add_argument(
+    removal.add_argument(
         "--prune",
         action="store_true",
         help="Serato 4.x: remove tool-created crates whose source folder no "
-             "longer exists on disk (reconciliation; never touches your own crates)",
+             "longer exists on disk, and sync nothing (never touches your own crates)",
+    )
+    sync_parser.add_argument(
+        "--library-dir",
+        type=Path,
+        default=None,
+        help="Serato 4.x and later: the folder that holds root.sqlite and master.sqlite "
+             f"(default: {get_default_serato_library_path().parent}). "
+             "Give a copy of that folder to try a run on it",
+    )
+    sync_parser.add_argument(
+        "--keep-backups",
+        type=_keep_backups,
+        default=KEEP_BACKUPS,
+        metavar="N",
+        help="Serato 4.x and later: after a write that succeeded, keep this tool's own backups "
+             f"of the newest N runs and remove its older ones (default: {KEEP_BACKUPS}). "
+             "'all' removes none. A dry run lists what would go",
     )
     sync_parser.add_argument(
         "--verbose", "-v",
@@ -208,13 +246,15 @@ Safety:
     fix_parser.add_argument(
         "--repair-only",
         action="store_true",
-        help="Skip merges; only repair rows whose proposed path is unclaimed",
+        help="Only change the path of rows whose proposed path is unclaimed: no merges, "
+             "and orphan rows are kept",
     )
     fix_parser.add_argument(
         "--audit-log",
         type=Path,
         default=None,
-        help="Path to write the per-row audit CSV (default: alongside --from-csv)",
+        help="Path to write the per-row audit CSV (default: beside --from-csv, as "
+             "fix-paths-applied.csv with --apply and fix-paths-dry-run.csv without)",
     )
 
     # verify-paths command
@@ -260,7 +300,7 @@ Safety:
         "--csv-out",
         type=Path,
         default=None,
-        help="Directory to write path-fixes.csv (optional)",
+        help="Directory to write path-fixes.csv in, or a .csv file path (optional)",
     )
 
     # diagnose command
@@ -330,20 +370,37 @@ Safety:
         # legacy .crate path below is kept for Serato 3.x.
         from .serato_db import is_serato_4x, run_prune, run_sync
 
+        library_dir = args.library_dir.expanduser().resolve() if args.library_dir else None
+        use_library_dir(library_dir)
+        # A folder named on purpose that holds no root.sqlite is a mistake to stop on.
+        # Carrying on would take the Serato 3.x route and write .crate files instead.
+        if library_dir is not None and not is_serato_4x():
+            logger.error(f"--library-dir: no root.sqlite in {library_dir}. Nothing was written.")
+            return 1
+
         if is_serato_4x():
-            logger.info("Serato 4.x library detected — using the SQLite crate engine.")
+            logger.info("Serato 4.x or later library detected (root.sqlite) — "
+                        "using the SQLite crate engine.")
             # These flags only apply to the legacy 3.x .crate path (O6).
-            if args.overwrite or args.path_mode != "absolute" or args.subcrate_delimiter != "%%":
-                logger.warning("--overwrite/--path-mode/--subcrate-delimiter are Serato 3.x-only — ignoring on 4.x.")
+            ignored = [flag for flag, given in (
+                ("--overwrite", args.overwrite),
+                ("--path-mode", args.path_mode != "absolute"),
+                ("--subcrate-delimiter", args.subcrate_delimiter != "%%"),
+                ("--serato-root", args.serato_root is not None),
+                ("--verbose", args.verbose),
+            ) if given]
+            if ignored:
+                logger.warning(f"{', '.join(ignored)}: for Serato 3.x only — ignored on 4.x and later.")
             if args.prune or args.clean:
                 # --prune removes stale crates; --clean removes all tool-created crates
                 return run_prune(
                     music_root,
                     extensions=extensions,
-                    clean=(args.clean and not args.prune),
+                    clean=args.clean,
                     apply=args.apply,
                     top_level=args.top_level,
                     assume_yes=args.yes,
+                    keep_backups=args.keep_backups,
                 )
             return run_sync(
                 music_root,
@@ -352,7 +409,21 @@ Safety:
                 top_level=args.top_level,
                 include_empty=args.include_empty,
                 assume_yes=args.yes,
+                keep_backups=args.keep_backups,
             )
+
+        # The Serato 3.x route from here on. Say so for each flag it does not use.
+        ignored = [flag for flag, given in (
+            ("--prune", args.prune),
+            ("--top-level", args.top_level),
+            ("--yes", args.yes),
+            ("--keep-backups", args.keep_backups != KEEP_BACKUPS),
+        ) if given]
+        if ignored:
+            logger.warning(f"{', '.join(ignored)}: for Serato 4.x and later only — ignored on 3.x.")
+        if args.apply and is_serato_running():
+            logger.warning("Serato appears to be running. Quit it before writing crate files: "
+                           "this route does not stop for it.")
 
         serato_root = args.serato_root
         if serato_root is None:
@@ -415,7 +486,10 @@ Safety:
         csv_path = args.from_csv.expanduser().resolve()
         audit_log = args.audit_log
         if audit_log is None:
-            audit_log = csv_path.parent / "fix-paths-applied.csv"
+            # A dry run gets its own file name. Under the applied name it read as a
+            # record of work done, and it overwrote the record of an earlier --apply.
+            audit_log = csv_path.parent / (
+                "fix-paths-applied.csv" if args.apply else "fix-paths-dry-run.csv")
         else:
             audit_log = audit_log.expanduser().resolve()
 

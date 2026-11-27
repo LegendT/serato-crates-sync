@@ -18,10 +18,11 @@ duplicating them, and only ever treat tool-created crates as removable.
 """
 
 import json
-import shutil
+import re
 import sqlite3
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -34,6 +35,9 @@ __all__ = [
     "SERATO_LIBRARY_SPACE",
     "Anchors",
     "SyncResult",
+    "MEASURED_SCHEMA_VERSIONS",
+    "KEEP_BACKUPS",
+    "use_library_dir",
     "get_serato_library_dir",
     "get_root_db_path",
     "get_master_db_path",
@@ -47,6 +51,7 @@ __all__ = [
     "save_manifest",
     "merge_manifest",
     "owned_ids_for",
+    "records_for",
     "top_level_for",
     "bump_revision",
     "validate_integrity",
@@ -63,6 +68,21 @@ SERATO_LIBRARY_SPACE = "Serato Library"
 
 MANIFEST_DIRNAME = ".serato-crates-sync"
 MANIFEST_FILENAME = "manifest.json"
+
+# The schema versions (PRAGMA user_version of root.sqlite) this engine has written
+# and Serato has then been seen to read: 202 is Serato 4.x, 203 is Serato 5.0.0.
+# A dry run works on any version. --apply is refused on any other, so that the
+# first write to a new Serato release is made on purpose and not by a routine run.
+# Add a version here once a sync has been checked on it.
+MEASURED_SCHEMA_VERSIONS = frozenset({202, 203})
+
+# The names this tool gives its backups, and no others. Retention goes by this
+# pattern alone: a backup under any other name (a label, another suffix) is never
+# listed and never removed.
+BACKUP_NAME = re.compile(r"^(root\.sqlite|master\.sqlite|manifest\.json)\.BACKUP\.(\d{8}_\d{6})$")
+
+# How many runs' backups to keep, the new one included.
+KEEP_BACKUPS = 3
 
 
 @dataclass
@@ -87,9 +107,21 @@ class SyncResult:
 
 # --- Locations -------------------------------------------------------------
 
+# Set by `sync --library-dir`, so that a run can be tried on a copy of the library.
+# None means the Serato library of this machine.
+_library_dir: Path | None = None
+
+
+def use_library_dir(path: Path | None) -> None:
+    """Point the engine at another folder that holds root.sqlite and master.sqlite."""
+    global _library_dir
+    _library_dir = path
+
+
 def get_serato_library_dir() -> Path:
-    """Directory holding master.sqlite / root.sqlite for the current platform."""
-    return get_default_serato_library_path().parent
+    """Directory holding master.sqlite / root.sqlite: the one given with
+    ``--library-dir``, else the Serato library of this machine."""
+    return _library_dir or get_default_serato_library_path().parent
 
 
 def get_root_db_path() -> Path:
@@ -99,7 +131,7 @@ def get_root_db_path() -> Path:
 
 def get_master_db_path() -> Path:
     """Path to master.sqlite (the aggregate Serato rebuilds from the spaces)."""
-    return get_default_serato_library_path()
+    return get_serato_library_dir() / "master.sqlite"
 
 
 def is_serato_4x() -> bool:
@@ -138,23 +170,53 @@ def discover_anchors(conn: sqlite3.Connection) -> Anchors:
     return Anchors(space_id=space_id, root_container_id=root[0])
 
 
-def build_asset_index(conn: sqlite3.Connection, space_id: int) -> dict[str, int]:
-    """Map ``portable_id`` -> ``space_asset.id`` for tracks already in the space."""
+def _untested_schema(conn: sqlite3.Connection) -> str | None:
+    """Why --apply is refused on this library, or None where its schema version is a measured one."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    if version in MEASURED_SCHEMA_VERSIONS:
+        return None
+    return (
+        f"root.sqlite is at schema version {version}. This tool has been checked on versions "
+        f"{' and '.join(str(v) for v in sorted(MEASURED_SCHEMA_VERSIONS))} only (Serato 4.x and "
+        "5.0.0), so it does not write to this library."
+    )
+
+
+def _asset_key(portable_id: str) -> bytes:
+    """The form in which two portable_ids are compared: Unicode NFC, ASCII letters lower-cased.
+
+    Lower-casing ASCII only is what the NOCASE unique index on asset.portable_id
+    does, so two rows the database keeps apart never share a key through case.
+    NFC, because the same name can reach Serato composed or decomposed: a real
+    library holds both forms.
+    """
+    return unicodedata.normalize("NFC", portable_id).encode().lower()
+
+
+def build_asset_index(conn: sqlite3.Connection, space_id: int) -> dict[bytes, int]:
+    """Map each track already in the space to its ``space_asset.id``.
+
+    The key is ``_asset_key(portable_id)``, not the raw string: a path that
+    differs from the stored one only in Unicode form or ASCII case is the same
+    file, and matching it exactly made a second asset for it.
+    """
     rows = conn.execute(
         "SELECT a.portable_id, sa.id FROM asset a "
         "JOIN space_asset sa ON sa.asset_id = a.id WHERE sa.space_id=?",
         (space_id,),
     )
-    return {pid: sa_id for pid, sa_id in rows}
+    return {_asset_key(pid): sa_id for pid, sa_id in rows}
 
 
 def to_portable_id(path: Path) -> str:
-    """Serato stores local paths volume-relative, without the leading slash.
+    """Serato stores a path on the boot volume without its leading slash.
 
     Uses ``resolve()`` so the string matches the canonical path Serato records
-    when it indexes the file (validated against real assets in the POC). Note:
-    on symlinked or case-variant paths the resolved form may differ from how a
-    given DJ references the file — see the symlink guard test in test_serato_db.
+    when it indexes the file (checked against real assets in the proof of
+    concept of 31 May 2026, Serato 4.x). On a symlinked or case-variant path
+    the resolved form can differ from the one Serato holds, and no test covers
+    that. A file on another drive is not handled: Serato stores those relative
+    to the drive (``MUSIC ARCHIVE/...``), and this returns ``Volumes/...``.
     """
     return str(path.resolve()).lstrip("/")
 
@@ -179,8 +241,32 @@ def save_manifest(manifest: dict) -> None:
     p.write_text(json.dumps(manifest, indent=2))
 
 
-# A manifest root entry is {"top_level": bool, "crates": [ids]}. Older versions
-# stored a bare list of ids (implicitly top_level=False); both are read here.
+def _backup_manifest(timestamp: str) -> Path:
+    """Copy the manifest beside itself, under the same timestamp as the database backups.
+
+    The manifest is part of what a run changes, so a restore has to put it back
+    too. It lists crate ids. A restored root.sqlite no longer has the ids a later
+    run made, and hands them out again to crates the DJ makes; with the newer
+    manifest still in place, prune and clean would take those crates for ours.
+    Where there is no manifest yet, the copy is an empty one, so that a restore
+    is always the same three files.
+    """
+    p = _manifest_path()
+    backup = p.with_name(f"{p.name}.BACKUP.{timestamp}")
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    backup.write_text(p.read_text() if p.exists() else json.dumps({"version": 1, "roots": {}}))
+    return backup
+
+
+# A manifest root entry is
+#   {"top_level": bool, "crates": [ids], "records": {"<id>": [parent_id, name]}}.
+# "records" (added 27 November 2026) holds what each crate was when the tool made
+# it or first saw it. An id alone is not proof of ownership: a restored root.sqlite
+# hands ids out again. Before a crate is removed, its record is compared with the
+# row that has the id now.
+# Two older forms are still read: an entry with no "records", and a bare list of
+# ids (implicitly top_level=False). Their ids have nothing to compare, so they are
+# trusted as before, and they get a record at the next `sync --apply` for that music root.
 
 def _entry_crates(entry) -> list[int]:
     if isinstance(entry, dict):
@@ -188,21 +274,52 @@ def _entry_crates(entry) -> list[int]:
     return list(entry or [])  # legacy bare list
 
 
-def merge_manifest(manifest: dict, music_root, new_ids, top_level: bool = False) -> dict:
+def _entry_records(entry) -> dict[int, tuple]:
+    if isinstance(entry, dict):
+        return {int(i): (r[0], r[1]) for i, r in entry.get("records", {}).items()}
+    return {}
+
+
+def _entry(top_level: bool, crates, records: dict[int, tuple]) -> dict:
+    crates = sorted(crates)
+    return {"top_level": bool(top_level), "crates": crates,
+            "records": {str(i): list(records[i]) for i in crates if i in records}}
+
+
+def _crate_records(conn: sqlite3.Connection) -> dict[int, tuple]:
+    """``id -> (parent_id, name)`` for every container in root.sqlite, as it is now."""
+    return {i: (parent, name) for i, parent, name in
+            conn.execute("SELECT id, parent_id, name FROM container")}
+
+
+def _same_crate(recorded: tuple, now: tuple) -> bool:
+    return recorded[0] == now[0] and recorded[1].casefold() == now[1].casefold()
+
+
+def merge_manifest(manifest: dict, music_root, new_ids, top_level: bool = False,
+                   records: dict[int, tuple] | None = None) -> dict:
     """Merge newly-created container ids into the manifest (C9: never overwrite).
 
     Records the ``top_level`` layout used, so prune mirrors the same shape (P2).
+    ``records`` adds ``id -> (parent_id, name)`` for ids that have none yet; a
+    record already in the manifest is kept as it is.
     """
     roots = manifest.setdefault("roots", {})
     key = str(music_root)
-    merged = sorted(set(_entry_crates(roots.get(key))) | set(new_ids))
-    roots[key] = {"top_level": bool(top_level), "crates": merged}
+    entry = roots.get(key)
+    merged = set(_entry_crates(entry)) | set(new_ids)
+    roots[key] = _entry(top_level, merged, {**(records or {}), **_entry_records(entry)})
     return manifest
 
 
 def owned_ids_for(manifest: dict, music_root) -> set[int]:
     """The container ids the tool previously created for this music root."""
     return set(_entry_crates(manifest.get("roots", {}).get(str(music_root))))
+
+
+def records_for(manifest: dict, music_root) -> dict[int, tuple]:
+    """``id -> (parent_id, name)`` as recorded for this music root. Empty for an older manifest."""
+    return _entry_records(manifest.get("roots", {}).get(str(music_root)))
 
 
 def top_level_for(manifest: dict, music_root) -> bool:
@@ -274,11 +391,12 @@ def _ensure_space_asset(
     ``None`` is returned (a not-yet-existing membership).
     """
     pid = to_portable_id(path)
-    if pid in asset_index:
-        return asset_index[pid]  # real space_asset id, or None sentinel (counted)
+    key = _asset_key(pid)
+    if key in asset_index:
+        return asset_index[key]  # real space_asset id, or None sentinel (counted)
     result.assets_created += 1
     if dry_run:
-        asset_index[pid] = None
+        asset_index[key] = None
         return None
     asset_id = ids.take("asset")
     try:
@@ -296,7 +414,7 @@ def _ensure_space_asset(
         "INSERT INTO space_asset (id,asset_id,space_id) VALUES (?,?,?)",
         (sa_id, asset_id, space_id),
     )
-    asset_index[pid] = sa_id
+    asset_index[key] = sa_id
     return sa_id
 
 
@@ -304,7 +422,7 @@ def mirror_tree(
     conn: sqlite3.Connection,
     tree,  # CratePlan (folder hierarchy from sync.build_crate_tree), or None
     anchors: Anchors,
-    asset_index: dict[str, int],
+    asset_index: dict[bytes, int],
     *,
     revision: int,
     owned_container_ids: set[int],
@@ -447,22 +565,78 @@ LARGE_CRATE_THRESHOLD = 500
 
 
 def _backup_db(path: Path, timestamp: str) -> Path | None:
-    """Copy a DB file to a timestamped sibling, after folding any WAL in (O4).
+    """Snapshot a database to a timestamped sibling with SQLite's Backup API.
 
-    A ``PRAGMA wal_checkpoint(TRUNCATE)`` first ensures the main file is a
-    complete snapshot before the copy (Serato is quit, so this is safe).
+    The API reads through the write-ahead log, so the snapshot is complete
+    whether or not the log has been folded into the main file, and it fails
+    with an error if it cannot finish. Before 27 November 2026 this was a plain
+    file copy after a checkpoint whose failure was ignored: it could miss
+    whatever was still in the log.
     """
     if not path.exists():
         return None
-    try:
-        c = sqlite3.connect(path, timeout=60)
-        c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        c.close()
-    except sqlite3.Error:
-        pass  # no WAL / already consistent
     backup = path.with_name(f"{path.name}.BACKUP.{timestamp}")
-    shutil.copy2(path, backup)
+    src = sqlite3.connect(path, timeout=60)
+    try:
+        dst = sqlite3.connect(backup)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
     return backup
+
+
+def _make_backups(root_db: Path, master_db: Path) -> str:
+    """Back up both databases and the manifest under one timestamp, and return it."""
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for db in (root_db, master_db):
+        b = _backup_db(db, ts)
+        if b:
+            print(f"Backup created: {b}")
+    print(f"Backup created: {_backup_manifest(ts)}")
+    return ts
+
+
+def _old_backups(keep: int | None) -> list[Path]:
+    """The backups this tool made that fall outside the newest ``keep`` runs.
+
+    A run is one timestamp: up to three files. Only files named by
+    ``BACKUP_NAME`` count, in the library folder and the manifest folder.
+    ``keep=None`` keeps everything. Nothing is removed here.
+    """
+    if keep is None:
+        return []
+    lib = get_serato_library_dir()
+    runs: dict[str, list[Path]] = {}
+    for folder in (lib, lib / MANIFEST_DIRNAME):
+        if folder.is_dir():
+            for f in folder.iterdir():
+                m = BACKUP_NAME.match(f.name)
+                if m and f.is_file():
+                    runs.setdefault(m.group(2), []).append(f)
+    old = sorted(runs)[:max(len(runs) - keep, 0)]
+    return sorted(f for ts in old for f in runs[ts])
+
+
+def _print_backups_to_remove(keep: int | None) -> None:
+    """In a dry run: which old backups the real run would remove. It makes one more
+    run's backups first, so one fewer of the present ones is kept."""
+    old = _old_backups(None if keep is None else max(keep - 1, 0))
+    if old:
+        size = sum(f.stat().st_size for f in old) / 1e9
+        print(f"With --apply, {len(old)} old backup file(s) of this tool would be removed "
+              f"({size:.1f} GB), keeping the newest {keep} run(s). --keep-backups all keeps them:")
+        for f in old:
+            print(f"  {f.name}")
+
+
+def _remove_old_backups(keep: int | None) -> None:
+    """After a run that wrote and succeeded: remove this tool's backups beyond the newest ``keep`` runs."""
+    for f in _old_backups(keep):
+        f.unlink()
+        print(f"Old backup removed: {f.name}")
 
 
 def _print_report(result: SyncResult, *, music_root: Path, apply: bool) -> None:
@@ -489,10 +663,8 @@ def _sync_pass(
     music_root: Path,
     *,
     top_level: bool,
-    commit: bool,
 ) -> SyncResult:
-    """One mirror pass. ``commit=False`` rolls back (preview, writes nothing);
-    ``commit=True`` commits, checkpoints, and persists the manifest.
+    """The mirror pass that writes: commits, checkpoints, and persists the manifest.
 
     Raises ``ValueError`` / ``sqlite3.Error`` on schema or integrity problems;
     the caller turns those into a clean exit code (O2).
@@ -515,39 +687,47 @@ def _sync_pass(
         )
         validate_integrity(conn, quick=True)
 
-        if commit:
-            conn.execute("COMMIT")
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            merge_manifest(manifest, music_root, result.created_container_ids, top_level)
-            try:
-                save_manifest(manifest)
-            except OSError as e:  # committed, but manifest not recorded (O7)
-                logger.error(
-                    f"Crates written but manifest save failed ({e}). Created "
-                    f"container ids (record these for re-run/clean): "
-                    f"{result.created_container_ids}"
-                )
-        else:
-            conn.execute("ROLLBACK")
+        conn.execute("COMMIT")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        # `owned` now holds the new crates too. Each one, and each older crate with
+        # no record yet, is recorded as it is in the database at this moment.
+        now_is = _crate_records(conn)
+        merge_manifest(manifest, music_root, result.created_container_ids, top_level,
+                       records={c: now_is[c] for c in owned if c in now_is})
+        try:
+            save_manifest(manifest)
+        except OSError as e:  # committed, but manifest not recorded (O7)
+            logger.error(
+                f"Crates written but manifest save failed ({e}). Created "
+                f"container ids (record these for re-run/clean): "
+                f"{result.created_container_ids}"
+            )
         return result
     except Exception:
-        conn.execute("ROLLBACK")
+        # Only where a transaction is open: a ROLLBACK before BEGIN, or after
+        # COMMIT, raises its own error and hides the one that matters.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
 
 
 def _confirm_large(result: SyncResult) -> bool:
-    """Interactive confirmation for a large write; refuse non-interactively."""
-    if not sys.stdin.isatty():
-        logger.error(
-            "Large change (creates assets or many crates) — re-run with --yes "
-            "to apply non-interactively."
-        )
-        return False
+    """Ask at the terminal before a large write."""
     prompt = (f"Create {result.crates_created} crates and {result.assets_created} "
               f"new library tracks? [y/N] ")
     return input(prompt).strip().lower() in ("y", "yes")
+
+
+def _on_another_drive(music_root: Path) -> bool:
+    """True for a music root under /Volumes.
+
+    Serato stores a file on another drive by its path on that drive
+    (``MUSIC ARCHIVE/...``). This engine would store ``Volumes/<drive>/...``.
+    What Serato does with such an entry is not measured, so --apply is refused.
+    """
+    return music_root.parts[:2] == ("/", "Volumes")
 
 
 def run_sync(
@@ -558,14 +738,18 @@ def run_sync(
     top_level: bool = False,
     include_empty: bool = False,
     assume_yes: bool = False,
+    keep_backups: int | None = KEEP_BACKUPS,
 ) -> int:
     """Mirror ``music_root`` into the Serato 4.x SQLite library. Returns exit code.
 
     Writes ``root.sqlite`` only (Serato aggregates into ``master.sqlite`` on
     launch). Dry-run by default. With ``apply`` it refuses to run while Serato
-    is open; runs a preview pass first, shows the plan, confirms large changes
-    (unless ``assume_yes``), backs up both databases, then writes inside one
-    ``BEGIN IMMEDIATE`` transaction with an integrity check and WAL checkpoint.
+    is open, on a schema version it has not been checked on, and for a music
+    root on another drive; runs a preview pass first, shows the plan, confirms
+    large changes (unless ``assume_yes``), backs up both databases and the
+    manifest, then writes inside one ``BEGIN IMMEDIATE`` transaction with an
+    integrity check and WAL checkpoint. After a write that succeeded it removes
+    its own backups beyond the newest ``keep_backups`` runs (None keeps all).
     """
     root_db = get_root_db_path()
     if not root_db.exists():
@@ -601,6 +785,7 @@ def run_sync(
         try:
             ro.execute("PRAGMA busy_timeout=5000")  # coexist if Serato is open
             assert_serato_4x_schema(ro)
+            refusals = [_untested_schema(ro)]
             anchors = discover_anchors(ro)
             index = build_asset_index(ro, anchors.space_id)
             owned = owned_ids_for(load_manifest(), music_root)
@@ -616,9 +801,25 @@ def run_sync(
 
     _print_report(result, music_root=music_root, apply=apply)
 
+    if _on_another_drive(music_root):
+        refusals.append(
+            f"{music_root} is on another drive. Serato stores those files by their path on "
+            "the drive, which this tool does not write, and what Serato does with the "
+            "entries it would write is not measured.")
+    refusals = [r for r in refusals if r]
+
     if not apply:
         print("DRY RUN — no changes written. Add --apply to write.")
+        for r in refusals:
+            print(f"With --apply this is refused: {r}")
+        if result.crates_created or result.tracks_added:
+            _print_backups_to_remove(keep_backups)
         return 0
+
+    if refusals:
+        for r in refusals:
+            logger.error(f"Sync refused, nothing was written: {r}")
+        return 1
 
     if result.crates_created == 0 and result.tracks_added == 0:
         print("Nothing new to write.")
@@ -627,24 +828,33 @@ def run_sync(
     # O1: confirm large changes before writing, unless --yes
     is_large = result.assets_created > 0 or result.crates_created > LARGE_CRATE_THRESHOLD
     if is_large and not assume_yes:
+        if not sys.stdin.isatty():
+            # Nobody to ask. This is a refusal, not a choice, so the exit code is 1:
+            # a cron job that never writes must not report success.
+            logger.error(
+                "Large change (creates assets or many crates) — re-run with --yes "
+                "to apply non-interactively. Nothing was written."
+            )
+            return 1
         if not _confirm_large(result):
             print("Aborted — nothing written.")
             return 0
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for db in (root_db, get_master_db_path()):
-        b = _backup_db(db, ts)
-        if b:
-            print(f"Backup created: {b}")
+    try:
+        _make_backups(root_db, get_master_db_path())
+    except (OSError, sqlite3.Error) as e:
+        logger.error(f"Backup failed, so nothing was written: {e}")
+        return 1
 
     try:
-        _sync_pass(root_db, tree, music_root, top_level=top_level, commit=True)
+        _sync_pass(root_db, tree, music_root, top_level=top_level)
     except (ValueError, sqlite3.Error) as e:
         logger.error(f"Apply failed (rolled back, library unchanged): {e}")
         return 1
 
     print("Applied. Quit-and-relaunch Serato to see the crates; it will "
           "analyse any new tracks.")
+    _remove_old_backups(keep_backups)
     return 0
 
 
@@ -666,8 +876,7 @@ def _desired_crate_paths(tree, top_level: bool) -> set:
     if top_level:
         for child in tree.children:
             walk(child, ())
-        if tree.tracks:
-            desired.add((tree.name,))
+        desired.add((tree.name,))   # the crate for tracks loose in the root: its folder is the root
     else:
         walk(tree, ())
     return desired
@@ -691,6 +900,24 @@ def _cf_path(path_tuple: tuple) -> tuple:
     """Case-fold a crate name-path so comparisons match the DB's NOCASE
     uniqueness (P7)."""
     return tuple(n.casefold() for n in path_tuple)
+
+
+def _unusable_collations(db: Path) -> set[str]:
+    """Collations a database's schema names that a plain SQLite connection lacks.
+
+    Serato 5.0 (schema version 203) sorts 13 indexes of master.sqlite with its own
+    ``serato_asset_string_comparator``. Version 202 (Serato 4.x) has none. Without
+    the collation SQLite cannot run ``quick_check`` on the file, nor write to the
+    tables those indexes are on (measured on 27 November 2026, SQLite 3.53.1).
+    """
+    conn = sqlite3.connect(f"{db.as_uri()}?mode=ro", uri=True, timeout=60)
+    try:
+        known = {r[1].upper() for r in conn.execute("PRAGMA collation_list")}
+        sql = " ".join(r[0] for r in conn.execute(
+            "SELECT sql FROM sqlite_master WHERE sql IS NOT NULL"))
+    finally:
+        conn.close()
+    return {c for c in re.findall(r"COLLATE\s+(\w+)", sql, re.IGNORECASE) if c.upper() not in known}
 
 
 def _prune_from_master(master_db: Path, removed_root_ids: list[int]) -> int:
@@ -720,23 +947,20 @@ def _prune_from_master(master_db: Path, removed_root_ids: list[int]) -> int:
             if mcids:
                 conn.executemany("DELETE FROM container WHERE id=?", [(c,) for c in mcids])
                 removed += len(mcids)
-        # tidy stale UI selections + wholesale-clear the transient sync-tracking
-        # tables (safe: Serato is quit, so these hold no live session state)
+        # Tidy stale UI selections. Serato's own tracking tables (updated_container,
+        # moved_container, removed_asset and the like) are left as they are: its
+        # triggers write to them during the deletes above, and whether Serato needs
+        # those rows at its next start is not measured. Until 27 November 2026 this
+        # emptied them, on an inference.
         conn.execute("DELETE FROM selection_asset WHERE container_asset_id "
                      "NOT IN (SELECT id FROM container_asset)")
-        for t in ("updated_container", "updated_smart_crate", "moved_container",
-                  "updated_container_tree", "updated_container_asset_list_columns",
-                  "removed_asset"):
-            try:
-                conn.execute(f"DELETE FROM {t}")
-            except sqlite3.OperationalError:
-                pass
         validate_integrity(conn, quick=True)
         conn.execute("COMMIT")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
         return removed
     except Exception:
-        conn.execute("ROLLBACK")
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
         raise
     finally:
         conn.close()
@@ -750,6 +974,7 @@ def run_prune(
     apply: bool = False,
     top_level: bool = False,
     assume_yes: bool = False,
+    keep_backups: int | None = KEEP_BACKUPS,
 ) -> int:
     """Remove tool-created crates from the Serato 4.x library. Returns exit code.
 
@@ -757,9 +982,10 @@ def run_prune(
     exists on disk. ``clean=True``: remove every crate the tool created for this
     music root. Only crates recorded in the manifest are ever touched — never
     user-made crates, and **never tracks** (created assets are retained as
-    valid library entries, with their analysis). Removes from **both**
-    ``root.sqlite`` and ``master.sqlite`` so the change is complete regardless
-    of Serato's launch-time reconciliation.
+    valid library entries, with their analysis). A crate whose name or parent
+    no longer matches what the manifest recorded for its id is left alone.
+    Removes from **both** ``root.sqlite`` and ``master.sqlite`` so the change
+    is complete regardless of Serato's launch-time reconciliation.
     """
     action = "clean" if clean else "prune"
     root_db = get_root_db_path()
@@ -791,43 +1017,99 @@ def run_prune(
         try:
             ro.execute("PRAGMA busy_timeout=5000")
             assert_serato_4x_schema(ro)
+            untested = _untested_schema(ro)
             anchors = discover_anchors(ro)
+            # An id is ours only while the crate that has it is still the one the
+            # manifest recorded. A restored root.sqlite gives ids out again, and a
+            # crate can be renamed or moved in Serato: either way it is theirs now.
+            now_is = _crate_records(ro)
+            recorded = records_for(manifest, music_root)
+            changed = {c for c in owned if c in recorded and c in now_is
+                       and not _same_crate(recorded[c], now_is[c])}
+            existed = {c for c in owned if c in now_is}
+            owned = owned - changed
             if clean:
-                targets = [c for c in owned
-                           if ro.execute("SELECT 1 FROM container WHERE id=?", (c,)).fetchone()]
+                targets = [c for c in owned if c in now_is]
             else:
+                # include_empty: every folder that exists is wanted, whatever it holds.
+                # Without it a crate was removed while its folder was still on disk:
+                # one made with --include-empty, or one whose files did not match
+                # the --extensions of this run.
                 desired = {_cf_path(p) for p in _desired_crate_paths(
-                    build_crate_tree(music_root, extensions), recorded_top_level)}
+                    build_crate_tree(music_root, extensions, include_empty=True),
+                    recorded_top_level)}
                 targets = [c for c in owned
                            if (p := _container_path(ro, c, anchors.root_container_id)) is not None
                            and _cf_path(p) not in desired]
+            # A crate the DJ made inside one of ours would be deleted with it,
+            # because container.parent_id is ON DELETE CASCADE. Keep every tool
+            # crate that has a crate of theirs anywhere below it.
+            holds_theirs: set[int] = set()
+            for cid in now_is:
+                if cid in owned:
+                    continue
+                up, seen = now_is[cid][0], set()
+                while up in now_is and up not in seen:
+                    seen.add(up)
+                    if up in owned:
+                        holds_theirs.add(up)
+                    up = now_is[up][0]
+            kept = [c for c in targets if c in holds_theirs]
+            targets = [c for c in targets if c not in holds_theirs]
         finally:
             ro.close()
     except (ValueError, sqlite3.Error) as e:
         logger.error(f"{action.capitalize()} failed: {e}")
         return 1
 
+    # Removing a crate also writes master.sqlite. Where that write cannot be
+    # checked, refuse before root.sqlite is touched: on Serato 5.0 the run used
+    # to delete from root.sqlite, rewrite the manifest, then fail on master.sqlite.
+    refusal = untested
+    if not refusal and targets and master_db.exists():
+        missing = _unusable_collations(master_db)
+        if missing:
+            refusal = (
+                "master.sqlite uses a collation this tool does not have "
+                f"({', '.join(sorted(missing))}), as Serato 5.0 and later do, so the "
+                "write to it cannot be checked. Delete the crates in Serato instead."
+            )
+
     print(f"\n{action.upper()}: {len(targets)} tool-created crate(s) to remove for {music_root}")
     print("(crate groupings only — your tracks and their analysis stay in the library)")
+    if kept:
+        print(f"Kept: {len(kept)} tool-created crate(s) that hold a crate you made.")
+    if changed:
+        print(f"Left alone: {len(changed)} crate(s) whose name or place no longer matches "
+              "what the manifest recorded. They are not treated as this tool's.")
     if not apply:
         print(f"DRY RUN — no changes written. Add --apply to {action}.")
+        if refusal:
+            print(f"With --apply this is refused: {refusal}")
+        elif targets:
+            _print_backups_to_remove(keep_backups)
         return 0
     if not targets:
         print("Nothing to remove.")
         return 0
+    if refusal:
+        logger.error(f"{action.capitalize()} refused, nothing was written: {refusal}")
+        return 1
     if not assume_yes:
         if not sys.stdin.isatty():
-            logger.error("Removal — re-run with --yes to proceed non-interactively.")
-            return 0
+            # Nobody to ask: a refusal, so exit code 1 (see run_sync).
+            logger.error("Removal — re-run with --yes to proceed non-interactively. "
+                         "Nothing was removed.")
+            return 1
         if input(f"Remove {len(targets)} crate(s)? [y/N] ").strip().lower() not in ("y", "yes"):
             print("Aborted — nothing removed.")
             return 0
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    for db in (root_db, master_db):
-        b = _backup_db(db, ts)
-        if b:
-            print(f"Backup created: {b}")
+    try:
+        ts = _make_backups(root_db, master_db)
+    except (OSError, sqlite3.Error) as e:
+        logger.error(f"Backup failed, so nothing was removed: {e}")
+        return 1
 
     # 1. Remove from root.sqlite (the authoritative store).
     conn = sqlite3.connect(root_db, timeout=60)
@@ -840,21 +1122,33 @@ def run_prune(
         validate_integrity(conn, quick=True)
         conn.execute("COMMIT")
         conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        survivors = [c for c in owned
-                     if conn.execute("SELECT 1 FROM container WHERE id=?", (c,)).fetchone()]
-    except Exception:
-        conn.execute("ROLLBACK")
-        conn.close()
-        logger.error(f"{action.capitalize()} failed (rolled back, library unchanged).")
+        after = _crate_records(conn)
+    except Exception as e:
+        # Say "rolled back" only where a transaction was open to roll back: a
+        # failure after COMMIT leaves root.sqlite changed.
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+            logger.error(f"{action.capitalize()} failed (rolled back, library unchanged): {e}")
+        else:
+            logger.error(
+                f"{action.capitalize()} failed after root.sqlite was changed ({e}). To return "
+                f"to a known-good state, quit Serato and restore the three .BACKUP.{ts} files "
+                "(root.sqlite, master.sqlite and manifest.json)."
+            )
         return 1
     finally:
         conn.close()
 
-    removed_root_ids = sorted(set(owned) - set(survivors))
+    # `changed` crates stay in the manifest with their record, so that every later
+    # run reports them again and none takes them for ours.
+    survivors = {c for c in owned | changed if c in after}
+    removed_now = len(existed - survivors)            # what this run took out of root.sqlite
+    # Ids the manifest listed that are gone from root.sqlite, whether this run
+    # removed them or they went earlier: their copies in master.sqlite go too.
+    removed_root_ids = sorted(owned - survivors)
     # Manifest reflects root (the source of truth) immediately.
-    manifest.setdefault("roots", {})[str(music_root)] = {
-        "top_level": recorded_top_level, "crates": sorted(survivors)
-    }
+    manifest.setdefault("roots", {})[str(music_root)] = _entry(
+        recorded_top_level, survivors, recorded)
     save_manifest(manifest)
 
     # 2. Remove the aggregated copies from master.sqlite (best-effort; root is
@@ -863,12 +1157,14 @@ def run_prune(
         _prune_from_master(master_db, removed_root_ids)
     except (ValueError, sqlite3.Error) as e:
         logger.error(
-            f"Removed {len(removed_root_ids)} crate(s) from root.sqlite, but the "
+            f"Removed {removed_now} crate(s) from root.sqlite, but the "
             f"master.sqlite cleanup failed ({e}). To return to a known-good state, "
-            f"quit Serato and restore BOTH .BACKUP.{ts} files (root + master)."
+            f"quit Serato and restore the three .BACKUP.{ts} files (root.sqlite, "
+            "master.sqlite and manifest.json)."
         )
         return 1
 
-    print(f"Removed {len(removed_root_ids)} crate(s) from root.sqlite and master.sqlite. "
+    print(f"Removed {removed_now} crate(s) from root.sqlite and master.sqlite. "
           "Relaunch Serato to see the change.")
+    _remove_old_backups(keep_backups)
     return 0

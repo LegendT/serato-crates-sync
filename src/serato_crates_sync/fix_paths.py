@@ -72,16 +72,22 @@ def backup_serato_library(library_path: Path) -> Path:
     finally:
         src.close()
 
-    verify = sqlite3.connect(str(backup_path))
     try:
-        result = verify.execute("PRAGMA integrity_check").fetchone()
-    finally:
-        verify.close()
-    if not result or result[0] != "ok":
-        raise RuntimeError(
-            f"Backup integrity_check failed: {result!r}. "
-            f"Refusing to proceed with --apply."
-        )
+        verify = sqlite3.connect(str(backup_path))
+        try:
+            result = verify.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            verify.close()
+        if not result or result[0] != "ok":
+            raise RuntimeError(
+                f"Backup integrity_check failed: {result!r}. "
+                f"Refusing to proceed with --apply."
+            )
+    except (sqlite3.Error, RuntimeError):
+        # A snapshot that failed its check is no backup. It is as big as the
+        # library, so it is not left behind (it was, before 27 November 2026).
+        backup_path.unlink()
+        raise
 
     return backup_path
 
@@ -91,12 +97,17 @@ def get_asset_referencing_columns(
 ) -> list[tuple[str, str, bool]]:
     """Find every column referencing asset.id (formal or informal).
 
-    Returns triples ``(table, column, has_cascade_fk)``. The third flag is
-    True when the column has a FOREIGN KEY to asset.id with ON DELETE
-    CASCADE — fix-paths can rely on the engine to clean up after a
-    ``DELETE FROM asset``. False means the reference is informal (column
-    named asset_id but no FK) or the FK action is not CASCADE — in that
-    case fix-paths must DELETE leftover dependent rows itself.
+    Returns triples ``(table, column, has_fk)``. The third flag is True
+    when the column has a FOREIGN KEY to asset.id, whatever its ON DELETE
+    action: the engine then deals with the dependent rows on a
+    ``DELETE FROM asset`` and fix-paths leaves them to it. False means the
+    reference is informal (a column named asset_id with no FK), and
+    fix-paths must DELETE the leftover dependent rows itself.
+
+    The action matters. Serato's ``history_entry.asset_id`` is ON DELETE
+    SET NULL (seen in schema versions 202 and 203): Serato keeps the play
+    history of a deleted track. Deleting those rows by hand, as this code
+    did before 27 November 2026, erased that history.
 
     Real Serato schemas have asset_id columns with NO foreign key on
     several important tables (container_asset, anonymous_table_0/1/2,
@@ -112,21 +123,16 @@ def get_asset_referencing_columns(
         if t == "asset" or not SAFE_IDENT.match(t):
             continue
 
-        cascade_fk_cols: set[str] = set()
+        fk_cols: set[str] = set()
         for fk in cur.execute(f"PRAGMA foreign_key_list({t})").fetchall():
             # fk: (id, seq, table, from, to, on_update, on_delete, match)
-            if (
-                fk[2] == "asset"
-                and fk[4] == "id"
-                and fk[6] == "CASCADE"
-                and SAFE_IDENT.match(fk[3])
-            ):
-                cascade_fk_cols.add(fk[3])
+            if fk[2] == "asset" and fk[4] == "id" and SAFE_IDENT.match(fk[3]):
+                fk_cols.add(fk[3])
                 refs.append((t, fk[3], True))
 
         for col in cur.execute(f"PRAGMA table_info({t})").fetchall():
             cname = col[1]
-            if cname == "asset_id" and SAFE_IDENT.match(cname) and cname not in cascade_fk_cols:
+            if cname == "asset_id" and SAFE_IDENT.match(cname) and cname not in fk_cols:
                 refs.append((t, cname, False))
     return refs
 
@@ -195,16 +201,18 @@ def _process_fix_row(
         return
 
     if confidence == "orphan":
-        if keep_orphans:
+        # --repair-only promises path UPDATEs and nothing else, so it keeps
+        # orphans too. Before 27 November 2026 it deleted them.
+        if keep_orphans or repair_only:
             stats.skipped_keep_orphans += 1
             log("skipped_keep_orphans")
             return
         if apply:
-            # Manually remove rows in informal asset_id columns (no FK
-            # CASCADE). Cascade-FK tables clean themselves up on the asset
-            # DELETE below.
-            for table, column, has_cascade in ref_columns:
-                if not has_cascade:
+            # Manually remove rows in informal asset_id columns (no FK).
+            # Tables with an FK are left to the engine on the asset DELETE
+            # below: it cascades, or sets NULL, as the schema says.
+            for table, column, has_fk in ref_columns:
+                if not has_fk:
                     conn.execute(
                         f"DELETE FROM {table} WHERE {column} = ?",
                         (asset_id,),
@@ -234,8 +242,9 @@ def _process_fix_row(
 
     existing_id = path_to_id.get((location_id, proposed.lower()))
     if existing_id == asset_id:
-        # Map already reports the asset under the proposed path (e.g. an
-        # earlier row updated it). Treat as a no-op skip.
+        # The proposed path differs from the row's own only by letter case
+        # (the stale-CSV check above rules out anything else). That is a
+        # rename of this row, not a merge with another: take the UPDATE branch.
         existing_id = None
 
     if existing_id is None:
@@ -258,7 +267,7 @@ def _process_fix_row(
         return
 
     if apply:
-        for table, column, has_cascade in ref_columns:
+        for table, column, has_fk in ref_columns:
             # UPDATE OR IGNORE: re-parent the row to the healthy asset
             # where possible. If the dependent table has a UNIQUE on
             # (other_id, asset_id) and the healthy id is already present,
@@ -267,7 +276,7 @@ def _process_fix_row(
                 f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
                 (existing_id, asset_id),
             )
-            if not has_cascade:
+            if not has_fk:
                 # No CASCADE will sweep up the rows UPDATE OR IGNORE
                 # skipped — delete them explicitly so the asset DELETE
                 # doesn't leave dangling references that crash Serato's
@@ -425,10 +434,10 @@ def run_fix_paths(
         conn = sqlite3.connect(str(library_path), isolation_level=None)
         conn.execute("PRAGMA foreign_keys = ON")
         # Verify FK enforcement actually engaged. SQLite silently no-ops
-        # unsupported pragmas; if we proceeded without it the cascade
-        # behaviour we rely on for selection_asset / dj_asset_metadata /
-        # space_asset / history_entry would not fire and we'd leak
-        # hundreds of thousands of dangling rows.
+        # unsupported pragmas; if we proceeded without it the foreign-key
+        # actions we rely on (CASCADE on selection_asset, dj_asset_metadata
+        # and space_asset; SET NULL on history_entry) would not fire and
+        # we'd leak hundreds of thousands of dangling rows.
         fk_state = conn.execute("PRAGMA foreign_keys").fetchone()
         if not fk_state or fk_state[0] != 1:
             conn.close()
@@ -493,7 +502,8 @@ def run_fix_paths(
 
     print_fix_stats(stats, dry_run=not apply)
     if audit_log_path is not None:
-        print(f"Audit log: {audit_log_path}")
+        print(f"{'Audit log' if apply else 'Dry-run report (nothing was written to the library)'}: "
+              f"{audit_log_path}")
     if apply:
         # Reminder for the rollback case: SQLite leaves -wal/-shm sibling
         # files alongside the main DB. Restoring just master.sqlite from

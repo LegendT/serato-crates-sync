@@ -20,7 +20,6 @@ __all__ = [
     "CratePlan",
     "SyncPlan",
     "is_audio_file",
-    "scan_folder_for_tracks",
     "build_crate_tree",
     "count_crates_and_tracks",
     "get_existing_crate_names",
@@ -45,13 +44,6 @@ class CratePlan:
     tracks: list[Path] = field(default_factory=list)
     children: list["CratePlan"] = field(default_factory=list)
 
-    @property
-    def full_name(self) -> str:
-        """Get hierarchical crate name (for display)."""
-        if self.parent_name:
-            return f"{self.parent_name} > {self.name}"
-        return self.name
-
 
 @dataclass
 class SyncPlan:
@@ -67,21 +59,6 @@ class SyncPlan:
 def is_audio_file(path: Path, extensions: frozenset[str]) -> bool:
     """Check if a file is a supported audio file."""
     return path.is_file() and path.suffix.lower() in extensions
-
-
-def scan_folder_for_tracks(
-    folder: Path,
-    extensions: frozenset[str]
-) -> list[Path]:
-    """Scan a folder for audio files (non-recursive, sorted)."""
-    tracks = []
-    try:
-        for item in sorted(folder.iterdir()):
-            if is_audio_file(item, extensions):
-                tracks.append(item)
-    except PermissionError:
-        logger.warning(f"Permission denied: {folder}")
-    return tracks
 
 
 def build_crate_tree(
@@ -268,7 +245,7 @@ def clean_existing_crates(serato_root: Path) -> int:
 
 
 def sanitize_crate_filename(filename: str, max_bytes: int = 240) -> str:
-    """Sanitize a crate filename for the filesystem."""
+    """Sanitise a crate filename for the filesystem."""
     invisible_chars = '​‌‍‎‏﻿­'
     for char in invisible_chars:
         filename = filename.replace(char, '')
@@ -422,16 +399,22 @@ def execute_sync(
         path_mode=path_mode,
     )
 
-    print("\nSync complete!")
+    # Every crate in the plan is either written or skipped as existing. Anything
+    # else failed: the crate library could not be imported, or a file could not
+    # be written. Before 27 November 2026 this returned True whatever happened.
+    failed = plan.total_crates - created - skipped
+    print("\nSync complete!" if not failed else "\nSync finished with errors.")
     print(f"  Crates created: {created}")
     print(f"  Crates skipped: {skipped}")
+    if failed:
+        print(f"  Crates NOT written: {failed}")
 
     if backup_path:
         print("\nTo restore from backup:")
         print(f"  rm -rf \"{subcrates}\"")
         print(f"  mv \"{backup_path}\" \"{subcrates}\"")
 
-    return True
+    return not failed
 
 
 def print_serato_guide(music_root: Path, extensions: frozenset[str], max_depth: int) -> None:
@@ -440,8 +423,8 @@ def print_serato_guide(music_root: Path, extensions: frozenset[str], max_depth: 
     print("SERATO CRATE CREATION GUIDE")
     print("=" * 70)
     print()
-    print("Since Serato DJ Pro 4.0.x doesn't support external crate creation,")
-    print("you'll need to create crates manually. Here's how:")
+    print("`serato-crates sync` makes these crates for you. To make them by hand")
+    print("in Serato DJ Pro instead, here is how:")
     print()
     print("STEPS:")
     print("1. Open Serato DJ Pro")
@@ -470,12 +453,12 @@ def print_serato_guide(music_root: Path, extensions: frozenset[str], max_depth: 
             pass
         return track_count, subdirs
 
-    def print_folder_tree(folder: Path, prefix: str = "", depth: int = 0) -> int:
-        if depth > max_depth:
-            return 0
+    def print_folder_tree(folder: Path, prefix: str = "", depth: int = 0) -> None:
+        # depth 0 lists the first level of folders, so max_depth levels are shown.
+        if depth >= max_depth:
+            return
 
         _, subdirs = scan_folder_summary(folder)
-        total_folders = 0
 
         for i, item in enumerate(subdirs):
             is_last = (i == len(subdirs) - 1)
@@ -486,22 +469,21 @@ def print_serato_guide(music_root: Path, extensions: frozenset[str], max_depth: 
             subfolder_info = f" [{len(child_subdirs)} subfolders]" if child_subdirs else ""
 
             print(f"{prefix}{connector}{item.name} {track_info}{subfolder_info}")
-            total_folders += 1
-
-            if depth < max_depth:
-                new_prefix = prefix + ("    " if is_last else "│   ")
-                total_folders += print_folder_tree(item, new_prefix, depth + 1)
-
-        return total_folders
+            print_folder_tree(item, prefix + ("    " if is_last else "│   "), depth + 1)
 
     root_tracks, _ = scan_folder_summary(music_root)
     print(f"{music_root.name}/ ({root_tracks} tracks)")
 
-    total = print_folder_tree(music_root)
+    print_folder_tree(music_root)
+
+    # The total is what `sync` would make, at any depth, not what the tree above
+    # had room to show: it used to count only the folders printed.
+    tree = build_crate_tree(music_root, extensions)
+    total, _ = count_crates_and_tracks([tree] if tree else [])
 
     print()
     print("-" * 70)
-    print(f"Total folders to create as crates: {total + 1}")
+    print(f"Total folders to create as crates: {total} (every folder that holds audio, at any depth)")
     print()
     print("TIP: In Serato's Files panel, you can:")
     print("  - Select multiple folders with Cmd+Click")
