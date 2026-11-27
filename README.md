@@ -7,6 +7,8 @@ CLI tools for the library of Serato DJ Pro 4.x and 5.0:
 - **`verify-paths`** — list the entries whose file has moved, and where each file is now.
 - **`fix-paths`** — write those repairs to `root.sqlite`. How Serato takes them up
   is only partly measured: see the table below.
+- **`guide`** — print your folder tree as step-by-step instructions for making the
+  crates by hand in Serato. It writes nothing.
 
 A typical run looks like this:
 
@@ -43,9 +45,11 @@ What the table rests on:
 - **`fix-paths --apply`** writes `root.sqlite`, under the same rules as `sync`, and
   asks first. What it writes was checked on a database with the real schema of
   Serato 5.0, and on no other, so a Serato 4.x library is refused. On Serato 5.0.0
-  an entry it deletes was gone from Serato's list after one launch (two merges,
-  27 November 2026). A changed path and a membership moved into a crate you made are
-  not measured, so make the first run of those a small one. See the caution at the top of
+  it made 223 merges on one library on 27 November 2026, in three runs, each
+  followed by a Serato launch: every entry it deleted was gone from Serato's list,
+  and every kept copy stayed in its crates. A changed path and a membership moved
+  into a crate you made are not measured, so make the first run of those a small
+  one. See the caution at the top of
   [`fix-paths` in docs/usage.md](docs/usage.md#fix-paths).
 
 [docs/internals.md](docs/internals.md#what-the-statements-about-serato-rest-on)
@@ -64,9 +68,10 @@ pip install -e .
 ```
 
 Requires Python 3.10+. Developed and tested on macOS; Windows and
-Linux are untested. The Serato-running guard relies on `pgrep`, so
-on platforms without it every command that writes falls back to the
-SQLite write-lock check alone.
+Linux are untested. The Serato-running guard relies on `pgrep`. On
+platforms without it, the commands that write a database fall back to
+the SQLite write-lock check alone. `sync` on Serato 3.x writes files,
+so it has no lock to check there.
 
 ## Quickstart
 
@@ -93,8 +98,9 @@ effect — this is why the database route is used. Measured on 4.x in May
 **On Serato 3.x** `sync` writes legacy `Subcrates/*.crate` files
 (subcrates as `House%%Deep.crate`), the format 3.x reads.
 
-A `./sync.sh` wrapper is included for the common case (defaults to
-`~/Music/_DJ MUSIC`, activates the venv, passes flags through). See
+A `./sync.sh` wrapper is included for the common case. It defaults to
+`~/Music/_DJ MUSIC`, runs the command from the project's `.venv`, and
+passes flags through. See
 [docs/usage.md](docs/usage.md#sync) for the full flag list.
 
 ### Audit library health (read-only)
@@ -118,6 +124,17 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply
 `path-fixes.csv` lists each broken entry and where its file is now.
 `fix-paths` without `--apply` reports what each repair would do, in
 `fix-paths-dry-run.csv`, and writes nothing to the library.
+
+If the files were moved by a tool that kept a record of each move (a
+dedupe or rename job), use that record instead of the search by file
+name. It follows renames, and it cannot pick the wrong one of several
+copies with the same name:
+
+```bash
+serato-crates verify-paths --from-moves moves.json --csv-out ~/diag   # moves.json: each move's src and dst
+```
+
+The record format is in [`verify-paths` in docs/usage.md](docs/usage.md#from-a-record-of-moves).
 
 `fix-paths --apply` writes the repairs to `root.sqlite`. Read the
 caution at the top of
@@ -150,9 +167,10 @@ crates, a focused tool has a few advantages:
   crate, and a crate stays until `--prune` finds its folder gone. The
   tool keeps one file of its own there, a manifest of the crates it made.
 - **Local-first and free.** No account, no subscription, no cloud. Your
-  library never leaves the machine — the tool only ever writes your local
-  Serato library (legacy `.crate` files on 3.x; the SQLite database on
-  4.x) and nothing else.
+  library never leaves the machine. The tool writes your local Serato
+  library (legacy `.crate` files on 3.x; the SQLite database on 4.x and
+  later), its own backups beside it, and the reports you ask for, and
+  nothing else.
 - **Safe by default.** Dry-run unless you pass `--apply`, and every write
   is preceded by a timestamped backup (the `Subcrates/` folder on 3.x;
   `root.sqlite`, `master.sqlite` and the manifest on 4.x and later) — a
@@ -207,7 +225,7 @@ truth and you just want Serato to reflect them.
   the code is right.
 - **[CHANGELOG.md](CHANGELOG.md)** — release history.
 - **[CONTRIBUTING.md](CONTRIBUTING.md)** — setup, test conventions,
-  and the safety invariants `fix-paths` must preserve.
+  and the safety invariants the commands that write must preserve.
 - **[SECURITY.md](SECURITY.md)** — vulnerability disclosure.
 
 ## License
