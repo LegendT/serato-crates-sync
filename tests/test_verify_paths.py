@@ -5,18 +5,27 @@ and the auto/ambiguous/orphan classification.
 """
 
 import csv
+import json
 import sqlite3
+import unicodedata
 
+import pytest
+
+from serato_crates_sync.fix_paths import apply_fixes
 from serato_crates_sync.library import DEFAULT_AUDIO_EXTENSIONS
 from serato_crates_sync.verify_paths import (
     build_filesystem_index,
     classify_candidates,
     find_candidates,
+    fixes_from_moves,
     fs_path_to_portable_id,
+    load_moves,
     portable_id_to_fs_path,
     score_candidate,
     verify_assets_against_filesystem,
 )
+
+from ._schemas import INFORMAL_SCHEMA
 
 ASSET_SCHEMA = """
 CREATE TABLE asset (
@@ -198,3 +207,165 @@ def test_verify_assets_against_filesystem_end_to_end(tmp_path):
     assert int(by_confidence["ambiguous"]["candidate_count"]) >= 2
 
     conn.close()
+
+
+# ---- --from-moves: repairs from the record of the tool that moved the files
+
+
+def test_load_moves_reads_the_three_shapes(tmp_path):
+    pair = {"src": "/a/old.mp3", "dst": "/a/new.mp3", "status": "rename"}
+    for name, text in (
+        ("ops.json", json.dumps({"ops": [pair]})),
+        ("list.json", json.dumps([pair])),
+        ("lines.jsonl", json.dumps(pair) + "\n\n" + json.dumps(pair) + "\n"),
+        ("one-line.jsonl", json.dumps(pair) + "\n"),               # one move: the whole file is one object
+    ):
+        p = tmp_path / name
+        p.write_text(text, encoding="utf-8")
+        assert load_moves(p)[0] == ("/a/old.mp3", "/a/new.mp3")
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"src": "a/relative.mp3", "dst": "/a/new.mp3"}]), encoding="utf-8")
+    with pytest.raises(ValueError):
+        load_moves(bad)
+    for broken in (["/a/old.mp3"],                                  # a row that is not an object
+                   {"ops": None},                                    # ops that is not a list
+                   [{"src": 1, "dst": "/a/new.mp3"}]):               # a src that is not a string
+        bad.write_text(json.dumps(broken), encoding="utf-8")
+        with pytest.raises(ValueError):
+            load_moves(bad)
+
+
+def test_build_filesystem_index_leaves_out_excluded_folders(tmp_path):
+    (tmp_path / "Album").mkdir()
+    (tmp_path / "_Superseded" / "Album").mkdir(parents=True)
+    (tmp_path / "Album" / "song.mp3").write_bytes(b"x")
+    (tmp_path / "_Superseded" / "Album" / "song.mp3").write_bytes(b"x")
+    index = build_filesystem_index(tmp_path, DEFAULT_AUDIO_EXTENSIONS, frozenset({"_Superseded"}))
+    assert [p for p, _ in index["song.mp3"]] == [str(tmp_path / "Album" / "song.mp3")]
+    index = build_filesystem_index(tmp_path, DEFAULT_AUDIO_EXTENSIONS, frozenset({"_superseded"}))
+    assert [p for p, _ in index["song.mp3"]] == [str(tmp_path / "Album" / "song.mp3")]    # any case
+
+
+def _pid(d, name):
+    """The portable_id Serato stores for d/name: the path without its leading slash."""
+    return str(d / name).lstrip("/")
+
+
+def _library(rows):
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(ASSET_SCHEMA)
+    _populate(conn, rows)
+    return conn
+
+
+def test_fixes_from_moves_classifies_each_move(tmp_path):
+    d = tmp_path / "music"
+    d.mkdir()
+    for name in ("kept.flac", "renamed.flac", "taken.flac"):
+        (d / name).write_bytes(b"x")
+    conn = _library([
+        {"location_id": 1, "portable_id": _pid(d, "spare.flac"), "file_name": "spare.flac"},     # gone: becomes a repair
+        {"location_id": 1, "portable_id": _pid(d, "taken.flac"), "file_name": "taken.flac"},     # still on disk: left
+        {"location_id": 1, "portable_id": _pid(d, "lost.flac"), "file_name": "lost.flac"},       # its new path is not on disk
+    ])
+    moves = [
+        (str(d / "spare.flac"), str(d / "kept.flac")),
+        (str(d / "taken.flac"), str(d / "renamed.flac")),
+        (str(d / "lost.flac"), str(d / "nowhere.flac")),
+        (str(d / "unknown.flac"), str(d / "kept.flac")),
+    ]
+    out = tmp_path / "fixes.csv"
+    report = fixes_from_moves(conn, moves, out)
+    assert (report.moves, report.to_fix, report.still_resolves, report.target_missing,
+            report.no_entry, report.excluded) == (4, 1, 1, 1, 1, 0)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert len(rows) == 1
+    assert rows[0]["old_portable_id"] == _pid(d, "spare.flac")
+    assert rows[0]["proposed_new_portable_id"] == _pid(d, "kept.flac")      # same leading-slash form as stored
+    assert rows[0]["confidence"] == "auto"
+
+
+def test_fixes_from_moves_matches_a_name_stored_in_the_other_unicode_form(tmp_path):
+    d = tmp_path / "music"
+    d.mkdir()
+    (d / "kept.flac").write_bytes(b"x")
+    stored = unicodedata.normalize("NFD", str(d / "Zéro.flac")).lstrip("/")
+    conn = _library([{"location_id": 1, "portable_id": stored, "file_name": "Zéro.flac"}])
+    report = fixes_from_moves(conn, [(unicodedata.normalize("NFC", str(d / "Zéro.flac")), str(d / "kept.flac"))], None)
+    assert report.to_fix == 1
+
+
+def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):    # INFORMAL_SCHEMA: the real shape
+    """The rows --from-moves writes are applied by the unchanged fix-paths: a set-aside spare
+    merges into the kept copy's row (crate memberships move), a renamed file's row changes path."""
+    d = tmp_path / "music"
+    d.mkdir()
+    (d / "kept.flac").write_bytes(b"x")
+    (d / "new name.flac").write_bytes(b"x")
+    conn = sqlite3.connect(":memory:", isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(INFORMAL_SCHEMA)
+    for i, name in ((1, "kept.flac"), (2, "spare.flac"), (3, "old name.flac")):
+        conn.execute("INSERT INTO asset (id, location_id, portable_id) VALUES (?, 1, ?)", (i, _pid(d, name)))
+    conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
+    conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 2)")     # the spare is in a crate
+    conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 3)")
+    for col in ("file_name TEXT", "file_size INTEGER", "artist TEXT DEFAULT ''", "name TEXT DEFAULT ''"):
+        conn.execute("ALTER TABLE asset ADD COLUMN " + col)
+    out = tmp_path / "fixes.csv"
+    report = fixes_from_moves(conn, [(str(d / "spare.flac"), str(d / "kept.flac")),
+                                     (str(d / "old name.flac"), str(d / "new name.flac"))], out)
+    assert report.to_fix == 2
+    stats = apply_fixes(conn, out, apply=True, keep_orphans=False, ambiguous_too=False,
+                        repair_only=False, audit_log_path=None)
+    assert (stats.merged, stats.updated) == (1, 1)
+    assert conn.execute("SELECT COUNT(*) FROM asset WHERE id = 2").fetchone()[0] == 0
+    assert conn.execute("SELECT portable_id FROM asset WHERE id = 3").fetchone()[0] == _pid(d, "new name.flac")
+    members = sorted(r[0] for r in conn.execute("SELECT asset_id FROM container_asset WHERE container_id = 10"))
+    assert members == [1, 3]
+
+
+def test_fixes_from_moves_skips_a_move_into_an_excluded_folder(tmp_path):
+    d = tmp_path / "music"
+    (d / "_Superseded").mkdir(parents=True)
+    (d / "_Superseded" / "song.flac").write_bytes(b"x")
+    conn = _library([{"location_id": 1, "portable_id": str(d / "song.flac").lstrip("/"), "file_name": "song.flac"}])
+    for name in ("_Superseded", "_SUPERSEDED"):                      # any case
+        report = fixes_from_moves(conn, [(str(d / "song.flac"), str(d / "_Superseded" / "song.flac"))], None,
+                                  frozenset({name}))
+        assert (report.to_fix, report.excluded) == (0, 1)
+
+
+def test_fixes_from_moves_proposes_the_kept_rows_own_spelling(tmp_path):
+    """The kept copy's row is stored decomposed and the move record is composed: the repair names
+    the row's stored path, so fix-paths finds that row and merges instead of making a second one."""
+    d = tmp_path / "music"
+    d.mkdir()
+    (d / "Zéro.flac").write_bytes(b"x")
+    kept = unicodedata.normalize("NFD", str(d / "Zéro.flac")).lstrip("/")
+    conn = _library([
+        {"location_id": 1, "portable_id": kept, "file_name": "Zéro.flac"},
+        {"location_id": 1, "portable_id": str(d / "spare.flac").lstrip("/"), "file_name": "spare.flac"},
+    ])
+    out = tmp_path / "fixes.csv"
+    fixes_from_moves(conn, [(str(d / "spare.flac"), unicodedata.normalize("NFC", str(d / "Zéro.flac")))], out)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert rows[0]["proposed_new_portable_id"] == kept
+
+
+def test_fixes_from_moves_repairs_every_row_of_one_file(tmp_path):
+    """One file held by two rows (portable_id with and without its leading slash):
+    both rows get a repair, not only the last one read."""
+    d = tmp_path / "music"
+    d.mkdir()
+    (d / "kept.flac").write_bytes(b"x")
+    conn = _library([
+        {"location_id": 1, "portable_id": _pid(d, "spare.flac"), "file_name": "spare.flac"},
+        {"location_id": 1, "portable_id": "/" + _pid(d, "spare.flac"), "file_name": "spare.flac"},
+    ])
+    out = tmp_path / "fixes.csv"
+    report = fixes_from_moves(conn, [(str(d / "spare.flac"), str(d / "kept.flac"))], out)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert report.to_fix == 2
+    assert sorted(r["asset_id"] for r in rows) == ["1", "2"]

@@ -69,6 +69,7 @@ Examples:
   # Apply the repairs (Serato DJ Pro must be quit first):
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv             # dry-run
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv --apply
+  (on Serato 4.x and later, --apply refuses to run: see the caution in docs/usage.md)
 
 Safety:
   - sync       : default is DRY RUN; backs up Subcrates folder; does not
@@ -76,7 +77,8 @@ Safety:
   - diagnose   : read-only; safe with Serato running.
   - verify-paths: read-only; safe with Serato running.
   - fix-paths  : default is DRY RUN; with --apply, refuses to run if
-                 Serato is detected, snapshots master.sqlite via the
+                 Serato is detected or root.sqlite is beside the library
+                 (Serato 4.x and later), snapshots master.sqlite via the
                  SQLite Backup API, and runs in one transaction.
 """,
     )
@@ -171,7 +173,8 @@ Safety:
     # fix-paths command
     fix_parser = subparsers.add_parser(
         "fix-paths",
-        help="Apply repairs from path-fixes.csv to master.sqlite (Serato must be closed)",
+        help="Apply repairs from path-fixes.csv to master.sqlite (Serato must be closed; "
+             "--apply refuses on Serato 4.x and later)",
     )
     fix_parser.add_argument(
         "--from-csv",
@@ -188,7 +191,8 @@ Safety:
     fix_parser.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write changes (default is dry-run)",
+        help="Actually write changes (default is dry-run). Refused when root.sqlite is beside "
+             "the library: on Serato 4.x and later a repair to master.sqlite alone can be lost",
     )
     fix_parser.add_argument(
         "--keep-orphans",
@@ -224,11 +228,27 @@ Safety:
         default=None,
         help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})",
     )
-    verify_parser.add_argument(
+    verify_source = verify_parser.add_mutually_exclusive_group(required=True)
+    verify_source.add_argument(
         "--music-root", "-m",
         type=Path,
-        required=True,
+        default=None,
         help="Root folder containing music (used to locate replacement files)",
+    )
+    verify_source.add_argument(
+        "--from-moves",
+        type=Path,
+        default=None,
+        help="JSON file of moves (src, dst) written by the tool that moved the files: each move "
+             "whose old path is gone and whose new path exists becomes an auto repair, with no search",
+    )
+    verify_parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="FOLDER",
+        help="Folder name (not a path) to leave out, at any depth, in any case (repeatable), "
+             "e.g. _Superseded. With --from-moves, a move into such a folder is skipped",
     )
     verify_parser.add_argument(
         "--extensions", "-e",
@@ -380,6 +400,18 @@ Safety:
         else:
             library_path = library_path.expanduser().resolve()
 
+        # Serato 4.x and later keep the authoritative library in root.sqlite and
+        # rebuild master.sqlite from it, so a repair here alone can be lost.
+        # Checked beside the file being written, so a copy elsewhere can still be tried.
+        if args.apply and (library_path.parent / "root.sqlite").exists():
+            print(
+                f"fix-paths --apply refused: root.sqlite is beside {library_path}, so this is a "
+                "Serato 4.x or later library, and a repair to master.sqlite alone can be lost. "
+                "Nothing was written. See the caution at the top of fix-paths in docs/usage.md.",
+                file=sys.stderr,
+            )
+            return 1
+
         csv_path = args.from_csv.expanduser().resolve()
         audit_log = args.audit_log
         if audit_log is None:
@@ -406,9 +438,12 @@ Safety:
         else:
             library_path = library_path.expanduser().resolve()
 
-        music_root = validate_music_root(args.music_root)
-        if music_root is None:
-            return 1
+        moves_path = args.from_moves.expanduser().resolve() if args.from_moves else None
+        music_root = None
+        if moves_path is None:
+            music_root = validate_music_root(args.music_root)
+            if music_root is None:
+                return 1
 
         extensions = parse_extensions(args.extensions)
 
@@ -416,7 +451,12 @@ Safety:
         if csv_out is not None:
             csv_out = csv_out.expanduser().resolve()
 
-        return run_verify_paths(library_path, music_root, extensions, csv_out)
+        exclude = frozenset(e.rstrip("/") for e in args.exclude)
+        for name in exclude:
+            if "/" in name or not name:
+                parser.error(f"--exclude takes a folder name, not a path: {name!r}")
+        return run_verify_paths(library_path, music_root, extensions, csv_out,
+                                exclude=exclude, moves_path=moves_path)
 
     elif args.command == "diagnose":
         from .diagnose import run_diagnose
