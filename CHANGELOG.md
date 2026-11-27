@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-11-27
+
+`fix-paths --apply` can repair a Serato 5.0.0 library for the first time: it
+now writes the repairs to `root.sqlite`. Used the same day on one library for
+223 merges, each run followed by a Serato launch and checked in both databases.
+
 ### Changed
 
 - **`fix-paths --apply` writes `root.sqlite`.** It was refused on every
@@ -325,7 +331,8 @@ The version number is now set in one place, `src/serato_crates_sync/__init__.py`
 - `guide` subcommand: print step-by-step instructions for manually
   creating crates in Serato.
 
-[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/LegendT/serato-crates-sync/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.5.0
 [0.4.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.4.0
 [0.3.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.3.0
 [0.2.0]: https://github.com/LegendT/serato-crates-sync/releases/tag/v0.2.0
