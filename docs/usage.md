@@ -205,7 +205,48 @@ Read-only — no DB changes. `--csv-out` accepts either a directory
 (writes `path-fixes.csv` inside) or a `.csv` file path (writes straight
 to it).
 
+`--exclude FOLDER` (repeatable) leaves folders of that name out of the
+search, at any depth. Use it for a folder of copies set aside for
+deletion, such as `_Superseded`. Then no entry is relinked to a file that
+a purge will remove.
+
+### From a record of moves
+
+When the tool that moved the files kept a record of where each went (a
+dedupe or rename job), use it instead of a search:
+
+```bash
+serato-crates verify-paths --from-moves moves.json --csv-out /tmp/serato-diag
+```
+
+`moves.json` holds `src` and `dst` absolute paths. It can be an object
+with an `ops` list (the `crate-map.json` that a musicsync dedupe writes),
+a plain list, or one object per line. When all three of these are true,
+a move becomes an `auto` row:
+
+- Serato holds the old path.
+- The old path is gone from disk.
+- The new path is on disk.
+
+A search by name cannot follow a rename, but the record can. This mode
+does not need `--music-root`. With `--exclude`, a move into a folder of
+that name is skipped.
+
+Read the caution at the top of [`fix-paths`](#fix-paths) before you apply
+these rows on Serato 4.x or later.
+
 ## `fix-paths`
+
+> **Caution, Serato 4.x and later.** `fix-paths` writes `master.sqlite`
+> only. On these versions, `root.sqlite` is the authoritative store and
+> `master.sqlite` is an aggregate of it (see internals.md). A repair from
+> `fix-paths` leaves `root.sqlite` unchanged, so the repair can be lost.
+> Whether Serato reverts it on launch is not measured. On Serato 5.0,
+> `--apply` stops at the integrity check of the backup with this error:
+> `no such collation sequence: serato_asset_string_comparator`. It writes
+> nothing. Until `fix-paths` can write `root.sqlite`, use
+> `path-fixes.csv` on these versions as a list of repairs to make. Do not
+> apply it.
 
 Applies the repairs from a `path-fixes.csv` produced by `verify-paths`.
 
@@ -296,7 +337,7 @@ After running `sync --apply`, verify in Serato DJ Pro:
 6. **Click on crates** — tracks should load correctly.
 7. **Try loading a track** to the deck to confirm paths work.
 
-For `fix-paths --apply`, the equivalent checks are:
+For `fix-paths --apply` (Serato 3.x: see the caution at the top of [`fix-paths`](#fix-paths)), the equivalent checks are:
 
 1. Re-run `serato-crates diagnose` — the missing/corrupt counts should drop sharply.
 2. Open Serato — the warning triangles in your library should be gone for the rows the run repaired.

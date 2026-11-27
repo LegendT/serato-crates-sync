@@ -5,11 +5,23 @@ narrows by file_size when available, and ranks them by folder-ancestry
 similarity to the broken path. Emits ``path-fixes.csv`` classified
 ``auto`` / ``ambiguous`` / ``orphan`` for review and feeding into
 ``fix-paths``.
+
+With ``--from-moves`` it does not search at all: a tool that moved the
+files (a dedupe or rename job) says where each one went. Each move whose
+old path Serato still holds, whose old path is gone from disk and whose
+new path exists becomes an ``auto`` row. A search by filename cannot
+follow a rename, and can pick the wrong one of several same-named copies;
+the job's own record has neither fault.
+
+On Serato 4.x and later the rows are a list of repairs to make: see the
+caution at the top of ``fix-paths`` in docs/usage.md.
 """
 
 import csv
+import json
 import os
 import sqlite3
+import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +38,18 @@ __all__ = [
     "verify_assets_against_filesystem",
     "print_path_verification_report",
     "run_verify_paths",
+    "MovesReport",
+    "load_moves",
+    "fixes_from_moves",
+    "print_moves_report",
+]
+
+# The columns fix-paths reads. One list for both writers, so they cannot drift apart.
+FIX_COLUMNS = [
+    "asset_id", "location_id", "old_portable_id",
+    "proposed_new_portable_id", "confidence",
+    "candidate_count", "alternate_paths",
+    "file_size_db", "file_name", "artist", "name",
 ]
 
 
@@ -60,6 +84,7 @@ def fs_path_to_portable_id(fs_path: str, leading_slash: bool) -> str:
 def build_filesystem_index(
     music_root: Path,
     extensions: frozenset[str],
+    exclude: frozenset[str] = frozenset(),
 ) -> dict[str, list[tuple[str, int]]]:
     """Walk music_root once, returning filename.lower() -> [(path, file_size_bytes), ...].
 
@@ -70,6 +95,10 @@ def build_filesystem_index(
     libraries with many same-named files (``Track01.mp3`` etc.).
 
     A size of ``-1`` means the stat failed for that entry.
+
+    Folders named in ``exclude`` are skipped at any depth: for example a
+    folder of copies set aside for deletion, which must never become the
+    target of a relink.
     """
     index: dict[str, list[tuple[str, int]]] = {}
 
@@ -84,7 +113,8 @@ def build_filesystem_index(
                 continue
             try:
                 if entry.is_dir(follow_symlinks=False):
-                    _walk(entry.path)
+                    if entry.name not in exclude:   # a name, matched exactly
+                        _walk(entry.path)
                     continue
                 if not entry.is_file(follow_symlinks=False):
                     continue
@@ -198,12 +228,7 @@ def verify_assets_against_filesystem(
     if csv_path is not None:
         csv_file = csv_path.open("w", newline="", encoding="utf-8")
         csv_writer = csv.writer(csv_file)
-        csv_writer.writerow([
-            "asset_id", "location_id", "old_portable_id",
-            "proposed_new_portable_id", "confidence",
-            "candidate_count", "alternate_paths",
-            "file_size_db", "file_name", "artist", "name",
-        ])
+        csv_writer.writerow(FIX_COLUMNS)
 
     next_progress = progress_every
     try:
@@ -270,6 +295,132 @@ def verify_assets_against_filesystem(
     )
 
 
+@dataclass
+class MovesReport:
+    """Result of turning a moves file into repair rows."""
+    moves: int
+    to_fix: int
+    still_resolves: int
+    no_entry: int
+    target_missing: int
+    excluded: int = 0
+
+
+def load_moves(path: Path) -> list[tuple[str, str]]:
+    """(old path, new path) pairs from a moves file.
+
+    Accepted shapes, all JSON: an object with an ``ops`` list (the
+    ``crate-map.json`` a musicsync dedupe writes), a plain list, or one
+    object per line. Each object needs absolute ``src`` and ``dst`` paths;
+    other keys are ignored.
+    """
+    text = path.read_text(encoding="utf-8")
+    try:
+        data = json.loads(text)
+        if isinstance(data, dict):                     # an ops object, or a one-line file of one move
+            rows = data["ops"] if "ops" in data else [data]
+        else:
+            rows = data
+    except json.JSONDecodeError:
+        rows = [json.loads(line) for line in text.splitlines() if line.strip()]
+    pairs = []
+    for n, r in enumerate(rows, 1):
+        if not isinstance(r, dict):
+            raise ValueError(f"{path}: move {n} is not an object with 'src' and 'dst'")
+        src, dst = r.get("src"), r.get("dst")
+        if not src or not dst or not src.startswith("/") or not dst.startswith("/"):
+            raise ValueError(f"{path}: move {n} needs absolute 'src' and 'dst' paths")
+        pairs.append((src, dst))
+    return pairs
+
+
+def _nfc(s: str) -> str:
+    return unicodedata.normalize("NFC", s)
+
+
+def fixes_from_moves(
+    conn: sqlite3.Connection,
+    moves: list[tuple[str, str]],
+    csv_path: Path | None,
+    exclude: frozenset[str] = frozenset(),
+) -> MovesReport:
+    """Write one ``auto`` repair row for each move whose old path Serato still holds.
+
+    ``fix-paths`` then changes the row's path, or merges it into the row
+    the new path already has. Left out, and counted:
+
+    - an old path that still exists on disk: another file holds that name
+      now (a kept copy renamed into it, say), so the row is still good;
+    - an old path Serato has no row for;
+    - a new path that is not on disk;
+    - a new path inside a folder named in ``exclude``.
+
+    Paths are matched exactly, or failing that in Unicode NFC form, because
+    the same name can be stored composed in one place and decomposed in
+    another. Where the new path already has a row, the row's own stored
+    spelling is proposed, so that fix-paths finds it and merges.
+    """
+    rows: dict[str, sqlite3.Row] = {}
+    nfc_rows: dict[str, sqlite3.Row] = {}
+    for row in conn.execute(
+        "SELECT id, location_id, portable_id, file_name, file_size, "
+        "       artist, name FROM asset"
+    ):
+        fs_path = portable_id_to_fs_path(row["portable_id"] or "")
+        rows[fs_path] = row
+        nfc_rows.setdefault(_nfc(fs_path), row)
+
+    to_fix = still = no_entry = missing = excluded = 0
+    csv_file = None
+    writer = None
+    if csv_path is not None:
+        csv_file = csv_path.open("w", newline="", encoding="utf-8")
+        writer = csv.writer(csv_file)
+        writer.writerow(FIX_COLUMNS)
+    try:
+        for src, dst in moves:
+            row = rows.get(src) or nfc_rows.get(_nfc(src))
+            if row is None:
+                no_entry += 1
+            elif exclude and exclude.intersection(dst.split(os.sep)):
+                excluded += 1
+            elif os.path.exists(src):
+                still += 1
+            elif not os.path.exists(dst):
+                missing += 1
+            else:
+                to_fix += 1
+                if writer is not None:
+                    portable_id = row["portable_id"] or ""
+                    kept = rows.get(dst) or nfc_rows.get(_nfc(dst))
+                    proposed = (kept["portable_id"] if kept is not None
+                                else fs_path_to_portable_id(dst, leading_slash=portable_id.startswith("/")))
+                    writer.writerow([
+                        row["id"], row["location_id"], portable_id, proposed,
+                        "auto", 1, "", row["file_size"], row["file_name"],
+                        row["artist"], row["name"],
+                    ])
+    finally:
+        if csv_file is not None:
+            csv_file.close()
+    return MovesReport(moves=len(moves), to_fix=to_fix, still_resolves=still,
+                       no_entry=no_entry, target_missing=missing, excluded=excluded)
+
+
+def print_moves_report(report: MovesReport) -> None:
+    """Print a verify-paths --from-moves summary to stdout."""
+    print(f"\n{'='*60}")
+    print("MOVES TURNED INTO REPAIRS")
+    print(f"{'='*60}")
+    print(f"Moves read:                       {report.moves:>8,}")
+    print(f"Repairs found (auto):             {report.to_fix:>8,}")
+    print(f"Skipped, old path still on disk:  {report.still_resolves:>8,}")
+    print(f"Skipped, not in the library:      {report.no_entry:>8,}")
+    print(f"Skipped, new path not on disk:    {report.target_missing:>8,}")
+    print(f"Skipped, new path in --exclude:   {report.excluded:>8,}")
+    print(f"{'='*60}\n")
+
+
 def print_path_verification_report(report: PathVerificationReport) -> None:
     """Print a verify-paths summary to stdout."""
     broken = report.auto_fix + report.ambiguous + report.orphan
@@ -290,17 +441,52 @@ def print_path_verification_report(report: PathVerificationReport) -> None:
     print(f"{'='*60}\n")
 
 
+def _csv_path_for(csv_out_dir: Path | None) -> Path | None:
+    """Accept either a directory (path-fixes.csv inside) or a path ending in .csv."""
+    if csv_out_dir is None:
+        return None
+    if csv_out_dir.suffix.lower() == ".csv":
+        csv_out_dir.parent.mkdir(parents=True, exist_ok=True)
+        return csv_out_dir
+    csv_out_dir.mkdir(parents=True, exist_ok=True)
+    return csv_out_dir / "path-fixes.csv"
+
+
 def run_verify_paths(
     library_path: Path,
-    music_root: Path,
+    music_root: Path | None,
     extensions: frozenset[str],
     csv_out_dir: Path | None,
+    exclude: frozenset[str] = frozenset(),
+    moves_path: Path | None = None,
 ) -> int:
-    """Read-only check that every asset path resolves; emit repair candidates."""
+    """Read-only check that every asset path resolves; emit repair candidates.
+
+    With ``moves_path`` the repair rows come from that file instead of a
+    search, and ``music_root`` is not used.
+    """
     if not library_path.exists():
         logger.error(f"Serato library not found: {library_path}")
         return 1
-    if not music_root.exists() or not music_root.is_dir():
+    if moves_path is not None:
+        try:
+            moves = load_moves(moves_path)
+        except (OSError, ValueError, KeyError) as e:
+            logger.error(f"Cannot read moves file: {e}")
+            return 1
+        csv_path = _csv_path_for(csv_out_dir)
+        print(f"Reading {len(moves):,} moves from: {moves_path}")
+        conn = connect_serato_library_readonly(library_path)
+        try:
+            report = fixes_from_moves(conn, moves, csv_path, exclude)
+        finally:
+            conn.close()
+        print_moves_report(report)
+        if csv_path is not None:
+            print(f"Repairs listed in: {csv_path}")
+            print("On Serato 4.x and later, read the caution at the top of fix-paths in docs/usage.md first.\n")
+        return 0
+    if music_root is None or not music_root.exists() or not music_root.is_dir():
         logger.error(f"Music root not found or not a directory: {music_root}")
         return 1
 
@@ -308,7 +494,7 @@ def run_verify_paths(
 
     print(f"Indexing files under: {music_root}")
     walk_start = _time.monotonic()
-    fs_index = build_filesystem_index(music_root, extensions)
+    fs_index = build_filesystem_index(music_root, extensions, exclude)
     walk_elapsed = _time.monotonic() - walk_start
     total_files = sum(len(paths) for paths in fs_index.values())
     print(
@@ -316,16 +502,7 @@ def run_verify_paths(
         f"({walk_elapsed:.1f}s)\n"
     )
 
-    csv_path: Path | None = None
-    if csv_out_dir is not None:
-        # Accept either a directory (write path-fixes.csv inside) or a
-        # path ending in .csv (write straight to that file).
-        if csv_out_dir.suffix.lower() == ".csv":
-            csv_path = csv_out_dir
-            csv_path.parent.mkdir(parents=True, exist_ok=True)
-        else:
-            csv_out_dir.mkdir(parents=True, exist_ok=True)
-            csv_path = csv_out_dir / "path-fixes.csv"
+    csv_path = _csv_path_for(csv_out_dir)
 
     print(f"Verifying assets in: {library_path}")
     verify_start = _time.monotonic()

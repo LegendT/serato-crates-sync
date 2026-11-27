@@ -69,6 +69,7 @@ Examples:
   # Apply the repairs (Serato DJ Pro must be quit first):
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv             # dry-run
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv --apply
+  (fix-paths writes master.sqlite only: on Serato 4.x and later read docs/usage.md first)
 
 Safety:
   - sync       : default is DRY RUN; backs up Subcrates folder; does not
@@ -224,11 +225,27 @@ Safety:
         default=None,
         help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})",
     )
-    verify_parser.add_argument(
+    verify_source = verify_parser.add_mutually_exclusive_group(required=True)
+    verify_source.add_argument(
         "--music-root", "-m",
         type=Path,
-        required=True,
+        default=None,
         help="Root folder containing music (used to locate replacement files)",
+    )
+    verify_source.add_argument(
+        "--from-moves",
+        type=Path,
+        default=None,
+        help="JSON file of moves (src, dst) written by the tool that moved the files: each move "
+             "whose old path is gone and whose new path exists becomes an auto repair, with no search",
+    )
+    verify_parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="FOLDER",
+        help="Folder name to leave out, at any depth (repeatable), e.g. _Superseded. "
+             "With --from-moves, a move into such a folder is skipped",
     )
     verify_parser.add_argument(
         "--extensions", "-e",
@@ -406,9 +423,12 @@ Safety:
         else:
             library_path = library_path.expanduser().resolve()
 
-        music_root = validate_music_root(args.music_root)
-        if music_root is None:
-            return 1
+        moves_path = args.from_moves.expanduser().resolve() if args.from_moves else None
+        music_root = None
+        if moves_path is None:
+            music_root = validate_music_root(args.music_root)
+            if music_root is None:
+                return 1
 
         extensions = parse_extensions(args.extensions)
 
@@ -416,7 +436,8 @@ Safety:
         if csv_out is not None:
             csv_out = csv_out.expanduser().resolve()
 
-        return run_verify_paths(library_path, music_root, extensions, csv_out)
+        return run_verify_paths(library_path, music_root, extensions, csv_out,
+                                exclude=frozenset(e.rstrip("/") for e in args.exclude), moves_path=moves_path)
 
     elif args.command == "diagnose":
         from .diagnose import run_diagnose

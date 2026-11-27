@@ -28,6 +28,9 @@ Serato keeps two largely independent stores on disk:
   revision-tracked "Serato Library" space store that `sync` writes to
   create crates and import tracks; Serato aggregates it into
   `master.sqlite` on launch. See [Serato 4.x crate engine](#serato-4x-crate-engine).
+  `fix-paths` writes `master.sqlite` only, so on 4.x and later its
+  repairs leave `root.sqlite` unchanged: see the caution at the top of
+  `fix-paths` in usage.md.
 
 There's also a legacy `~/Music/_Serato_/database V2` file from older
 Serato versions; this tool does not touch it directly. On Serato DJ
