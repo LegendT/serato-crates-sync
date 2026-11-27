@@ -110,6 +110,54 @@ def test_verify_paths_smoke(monkeypatch, tmp_path):
     assert (csv_out / "path-fixes.csv").exists()
 
 
+def test_verify_paths_from_moves_smoke(monkeypatch, tmp_path):
+    """--from-moves through main(): the broken row's move becomes a repair row,
+    and --exclude skips a move into a folder of that name."""
+    import csv
+    import json
+
+    music = _make_music_root(tmp_path / "music")
+    library = tmp_path / "master.sqlite"
+    _make_real_shape_library(library)
+    _seed_assets(library, music)
+    moves = tmp_path / "moves.json"
+    moves.write_text(json.dumps({"ops": [
+        {"src": "/Users/nobody/missing/song.mp3", "dst": str(music / "HipHop" / "track2.mp3")},
+    ]}), encoding="utf-8")
+
+    csv_out = tmp_path / "diag"
+    rc = _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+                  "--from-moves", str(moves), "--csv-out", str(csv_out))
+    assert rc == 0
+    rows = list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8")))
+    assert [r["asset_id"] for r in rows] == ["2"]
+
+    rc = _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+                  "--from-moves", str(moves), "--exclude", "HipHop", "--csv-out", str(csv_out))
+    assert rc == 0
+    assert list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8"))) == []
+
+
+def test_verify_paths_exclude_smoke(monkeypatch, tmp_path):
+    """--exclude through main() in search mode: an excluded folder is not indexed,
+    so the only copy of the broken row's file name is not proposed."""
+    import csv
+
+    music = _make_music_root(tmp_path / "music")
+    (music / "_Superseded").mkdir()
+    (music / "_Superseded" / "song.mp3").write_bytes(b"\x00")
+    library = tmp_path / "master.sqlite"
+    _make_real_shape_library(library)
+    _seed_assets(library, music)
+
+    csv_out = tmp_path / "diag"
+    rc = _run_cli(monkeypatch, "verify-paths", "--library-path", str(library),
+                  "--music-root", str(music), "--exclude", "_Superseded", "--csv-out", str(csv_out))
+    assert rc == 0
+    rows = list(csv.DictReader((csv_out / "path-fixes.csv").open(encoding="utf-8")))
+    assert all("_Superseded" not in r["proposed_new_portable_id"] for r in rows)
+
+
 def test_fix_paths_dry_run_smoke(monkeypatch, tmp_path):
     music = _make_music_root(tmp_path / "music")
     library = tmp_path / "master.sqlite"

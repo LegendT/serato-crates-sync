@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`verify-paths --from-moves FILE`.** Builds the repair rows from the
+  record of moves that the moving tool kept, with no search. The record
+  is JSON with `src` and `dst` paths. It follows renames, and it cannot
+  pick the wrong one of several same-named copies. It counts and skips
+  each move that cannot become a repair.
+- **`verify-paths --exclude FOLDER`** (repeatable). Leaves folders of
+  that name out of the search. With `--from-moves`, it skips a move into
+  such a folder. Then nothing is relinked to a set-aside copy.
 - **Serato DJ Pro 4.x crate engine.** `sync` now detects a 4.x SQLite
   library (`root.sqlite`) and writes it directly instead of legacy
   `.crate` files (which 4.x ignores). It creates one crate per folder
@@ -36,6 +44,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `verify-paths` takes exactly one of `--music-root` and `--from-moves`.
+- Docs: a caution at the top of `fix-paths` in usage.md. The README, the
+  CLI epilog and internals.md point to it. `fix-paths` writes
+  `master.sqlite` only, which on Serato 4.x and later is an aggregate of
+  `root.sqlite`. On Serato 5.0, `--apply` stops at the integrity check
+  of the backup with a missing collation.
 - Serato 3.x behaviour is unchanged: when no `root.sqlite` is present,
   `sync` still writes `Subcrates/*.crate` exactly as before. The
   `--overwrite`/`--path-mode`/`--subcrate-delimiter` options are 3.x-only

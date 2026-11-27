@@ -241,6 +241,11 @@ def test_build_filesystem_index_leaves_out_excluded_folders(tmp_path):
     assert [p for p, _ in index["song.mp3"]] == [str(tmp_path / "Album" / "song.mp3")]
 
 
+def _pid(d, name):
+    """The portable_id Serato stores for d/name: the path without its leading slash."""
+    return str(d / name).lstrip("/")
+
+
 def _library(rows):
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
@@ -254,11 +259,10 @@ def test_fixes_from_moves_classifies_each_move(tmp_path):
     d.mkdir()
     for name in ("kept.flac", "renamed.flac", "taken.flac"):
         (d / name).write_bytes(b"x")
-    pid = lambda name: str(d / name).lstrip("/")
     conn = _library([
-        {"location_id": 1, "portable_id": pid("spare.flac"), "file_name": "spare.flac"},     # gone: becomes a repair
-        {"location_id": 1, "portable_id": pid("taken.flac"), "file_name": "taken.flac"},     # still on disk: left
-        {"location_id": 1, "portable_id": pid("lost.flac"), "file_name": "lost.flac"},       # its new path is not on disk
+        {"location_id": 1, "portable_id": _pid(d, "spare.flac"), "file_name": "spare.flac"},     # gone: becomes a repair
+        {"location_id": 1, "portable_id": _pid(d, "taken.flac"), "file_name": "taken.flac"},     # still on disk: left
+        {"location_id": 1, "portable_id": _pid(d, "lost.flac"), "file_name": "lost.flac"},       # its new path is not on disk
     ])
     moves = [
         (str(d / "spare.flac"), str(d / "kept.flac")),
@@ -272,8 +276,8 @@ def test_fixes_from_moves_classifies_each_move(tmp_path):
             report.no_entry, report.excluded) == (4, 1, 1, 1, 1, 0)
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
     assert len(rows) == 1
-    assert rows[0]["old_portable_id"] == pid("spare.flac")
-    assert rows[0]["proposed_new_portable_id"] == pid("kept.flac")      # same leading-slash form as stored
+    assert rows[0]["old_portable_id"] == _pid(d, "spare.flac")
+    assert rows[0]["proposed_new_portable_id"] == _pid(d, "kept.flac")      # same leading-slash form as stored
     assert rows[0]["confidence"] == "auto"
 
 
@@ -294,12 +298,11 @@ def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
     d.mkdir()
     (d / "kept.flac").write_bytes(b"x")
     (d / "new name.flac").write_bytes(b"x")
-    pid = lambda name: str(d / name).lstrip("/")
     conn = sqlite3.connect(":memory:", isolation_level=None)
     conn.row_factory = sqlite3.Row
     conn.executescript(IDEALISED_SCHEMA)
     for i, name in ((1, "kept.flac"), (2, "spare.flac"), (3, "old name.flac")):
-        conn.execute("INSERT INTO asset (id, location_id, portable_id) VALUES (?, 1, ?)", (i, pid(name)))
+        conn.execute("INSERT INTO asset (id, location_id, portable_id) VALUES (?, 1, ?)", (i, _pid(d, name)))
     conn.execute("INSERT INTO container (id, name) VALUES (10, 'Crate')")
     conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 2)")     # the spare is in a crate
     conn.execute("INSERT INTO container_asset (container_id, asset_id) VALUES (10, 3)")
@@ -313,7 +316,7 @@ def test_moves_end_to_end_through_fix_paths_merge_and_update(tmp_path):
                         repair_only=False, audit_log_path=None)
     assert (stats.merged, stats.updated) == (1, 1)
     assert conn.execute("SELECT COUNT(*) FROM asset WHERE id = 2").fetchone()[0] == 0
-    assert conn.execute("SELECT portable_id FROM asset WHERE id = 3").fetchone()[0] == pid("new name.flac")
+    assert conn.execute("SELECT portable_id FROM asset WHERE id = 3").fetchone()[0] == _pid(d, "new name.flac")
     members = sorted(r[0] for r in conn.execute("SELECT asset_id FROM container_asset WHERE container_id = 10"))
     assert members == [1, 3]
 
@@ -343,3 +346,20 @@ def test_fixes_from_moves_proposes_the_kept_rows_own_spelling(tmp_path):
     fixes_from_moves(conn, [(str(d / "spare.flac"), unicodedata.normalize("NFC", str(d / "Zéro.flac")))], out)
     rows = list(csv.DictReader(out.open(encoding="utf-8")))
     assert rows[0]["proposed_new_portable_id"] == kept
+
+
+def test_fixes_from_moves_repairs_every_row_of_one_file(tmp_path):
+    """One file held by two rows (portable_id with and without its leading slash):
+    both rows get a repair, not only the last one read."""
+    d = tmp_path / "music"
+    d.mkdir()
+    (d / "kept.flac").write_bytes(b"x")
+    conn = _library([
+        {"location_id": 1, "portable_id": _pid(d, "spare.flac"), "file_name": "spare.flac"},
+        {"location_id": 1, "portable_id": "/" + _pid(d, "spare.flac"), "file_name": "spare.flac"},
+    ])
+    out = tmp_path / "fixes.csv"
+    report = fixes_from_moves(conn, [(str(d / "spare.flac"), str(d / "kept.flac"))], out)
+    rows = list(csv.DictReader(out.open(encoding="utf-8")))
+    assert report.to_fix == 2
+    assert sorted(r["asset_id"] for r in rows) == ["1", "2"]

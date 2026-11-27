@@ -17,6 +17,11 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv               # 3. dry-
 serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply       # 4. quit Serato, then write
 ```
 
+On Serato 4.x and later, read the caution at the top of
+[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths) before you use
+`--apply`: it writes `master.sqlite` only, and on Serato 5.0 it stops
+before it changes the library.
+
 ## Install
 
 Not yet on PyPI; install from source:
@@ -80,6 +85,11 @@ serato-crates fix-paths --from-csv ~/diag/path-fixes.csv --apply
 
 `fix-paths --apply` snapshots `master.sqlite` before any writes and
 runs the entire repair in a single SQLite transaction.
+
+On Serato 4.x and later, read the caution at the top of
+[`fix-paths` in docs/usage.md](docs/usage.md#fix-paths) before you use
+`--apply`: it writes `master.sqlite` only, and on Serato 5.0 it stops
+before it changes the library.
 
 ## Why folder-based crates?
 

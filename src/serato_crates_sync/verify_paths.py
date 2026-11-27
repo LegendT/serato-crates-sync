@@ -344,7 +344,7 @@ def fixes_from_moves(
     csv_path: Path | None,
     exclude: frozenset[str] = frozenset(),
 ) -> MovesReport:
-    """Write one ``auto`` repair row for each move whose old path Serato still holds.
+    """Write an ``auto`` repair row for each row Serato holds at a move's old path.
 
     ``fix-paths`` then changes the row's path, or merges it into the row
     the new path already has. Left out, and counted:
@@ -360,15 +360,17 @@ def fixes_from_moves(
     another. Where the new path already has a row, the row's own stored
     spelling is proposed, so that fix-paths finds it and merges.
     """
-    rows: dict[str, sqlite3.Row] = {}
-    nfc_rows: dict[str, sqlite3.Row] = {}
+    # A list per path: one file can have more than one row (a portable_id
+    # stored with and without its leading slash), and each row needs its repair.
+    rows: dict[str, list[sqlite3.Row]] = {}
+    nfc_rows: dict[str, list[sqlite3.Row]] = {}
     for row in conn.execute(
         "SELECT id, location_id, portable_id, file_name, file_size, "
         "       artist, name FROM asset"
     ):
         fs_path = portable_id_to_fs_path(row["portable_id"] or "")
-        rows[fs_path] = row
-        nfc_rows.setdefault(_nfc(fs_path), row)
+        rows.setdefault(fs_path, []).append(row)
+        nfc_rows.setdefault(_nfc(fs_path), []).append(row)
 
     to_fix = still = no_entry = missing = excluded = 0
     csv_file = None
@@ -379,8 +381,8 @@ def fixes_from_moves(
         writer.writerow(FIX_COLUMNS)
     try:
         for src, dst in moves:
-            row = rows.get(src) or nfc_rows.get(_nfc(src))
-            if row is None:
+            held = rows.get(src) or nfc_rows.get(_nfc(src))
+            if not held:
                 no_entry += 1
             elif exclude and exclude.intersection(dst.split(os.sep)):
                 excluded += 1
@@ -389,11 +391,11 @@ def fixes_from_moves(
             elif not os.path.exists(dst):
                 missing += 1
             else:
-                to_fix += 1
-                if writer is not None:
+                to_fix += len(held)
+                kept = rows.get(dst) or nfc_rows.get(_nfc(dst))
+                for row in held if writer is not None else ():
                     portable_id = row["portable_id"] or ""
-                    kept = rows.get(dst) or nfc_rows.get(_nfc(dst))
-                    proposed = (kept["portable_id"] if kept is not None
+                    proposed = (kept[0]["portable_id"] if kept
                                 else fs_path_to_portable_id(dst, leading_slash=portable_id.startswith("/")))
                     writer.writerow([
                         row["id"], row["location_id"], portable_id, proposed,

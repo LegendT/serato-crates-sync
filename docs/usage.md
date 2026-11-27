@@ -243,8 +243,9 @@ these rows on Serato 4.x or later.
 > `fix-paths` leaves `root.sqlite` unchanged, so the repair can be lost.
 > Whether Serato reverts it on launch is not measured. On Serato 5.0,
 > `--apply` stops at the integrity check of the backup with this error:
-> `no such collation sequence: serato_asset_string_comparator`. It writes
-> nothing. Until `fix-paths` can write `root.sqlite`, use
+> `no such collation sequence: serato_asset_string_comparator`. It changes
+> nothing in the library, but it leaves the backup it made beside it
+> (`master.sqlite.BACKUP.<timestamp>`, as big as the library). Until `fix-paths` can write `root.sqlite`, use
 > `path-fixes.csv` on these versions as a list of repairs to make. Do not
 > apply it.
 
@@ -337,7 +338,7 @@ After running `sync --apply`, verify in Serato DJ Pro:
 6. **Click on crates** — tracks should load correctly.
 7. **Try loading a track** to the deck to confirm paths work.
 
-For `fix-paths --apply` (Serato 3.x: see the caution at the top of [`fix-paths`](#fix-paths)), the equivalent checks are:
+For `fix-paths --apply` (read the caution at the top of [`fix-paths`](#fix-paths) first), the equivalent checks are:
 
 1. Re-run `serato-crates diagnose` — the missing/corrupt counts should drop sharply.
 2. Open Serato — the warning triangles in your library should be gone for the rows the run repaired.

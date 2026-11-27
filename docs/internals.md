@@ -57,7 +57,8 @@ fixes "old crates still showing" is that quitting Serato lets it
 re-read `Subcrates/` on next launch; with stale `.crate` files
 removed, the panel reflects the new layout. If you suspect
 `master.sqlite` is the problem (missing tracks, stale asset paths),
-use `diagnose` and `fix-paths` instead.
+use `diagnose` and `fix-paths` instead. On Serato 4.x and later, read
+the caution at the top of `fix-paths` in usage.md first.
 
 ## Design decisions
 
