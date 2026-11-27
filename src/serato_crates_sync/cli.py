@@ -7,7 +7,7 @@ and the package's logging config. Per-feature behaviour lives in:
 - ``serato_crates_sync.sync``         — generate crates from a folder tree
 - ``serato_crates_sync.diagnose``     — read-only health snapshot
 - ``serato_crates_sync.verify_paths`` — locate broken asset paths
-- ``serato_crates_sync.fix_paths``    — apply repairs to master.sqlite
+- ``serato_crates_sync.fix_paths``    — apply path repairs to root.sqlite
 - ``serato_crates_sync.library``      — shared SQLite/path helpers
 """
 
@@ -78,10 +78,10 @@ Examples:
   # emit repair candidates to path-fixes.csv (no DB changes):
   serato-crates verify-paths --music-root ~/Music/DJ --csv-out ~/serato-diag
 
-  # Apply the repairs (Serato DJ Pro must be quit first):
+  # Apply the repairs to root.sqlite (Serato DJ Pro must be quit first):
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv             # dry-run
   serato-crates fix-paths --from-csv ~/serato-diag/path-fixes.csv --apply
-  (on Serato 4.x and later, --apply refuses to run: see the caution in docs/usage.md)
+  (how Serato takes the repairs up is only partly measured: see the caution in docs/usage.md)
 
 Safety:
   - sync       : default is DRY RUN. Serato 4.x and later: backs up root.sqlite,
@@ -93,10 +93,11 @@ Safety:
                  existing .crate files unless --overwrite.
   - diagnose   : read-only; safe with Serato running.
   - verify-paths: read-only; safe with Serato running.
-  - fix-paths  : default is DRY RUN; with --apply, refuses to run if
-                 Serato is detected or root.sqlite is beside the library
-                 (Serato 4.x and later), snapshots master.sqlite via the
-                 SQLite Backup API, and runs in one transaction.
+  - fix-paths  : default is DRY RUN; with --apply it writes root.sqlite under
+                 the same rules as sync: asks first, refuses while Serato is
+                 open and on a library version it has not been checked on
+                 (checked: Serato 5.0.0), backs up root.sqlite, master.sqlite
+                 and the manifest, and runs in one transaction.
 """,
     )
 
@@ -211,8 +212,8 @@ Safety:
     # fix-paths command
     fix_parser = subparsers.add_parser(
         "fix-paths",
-        help="Apply repairs from path-fixes.csv to master.sqlite (Serato must be closed; "
-             "--apply refuses on Serato 4.x and later)",
+        help="Apply repairs from path-fixes.csv to root.sqlite (Serato 4.x and later; "
+             "Serato must be closed for --apply)",
     )
     fix_parser.add_argument(
         "--from-csv",
@@ -224,18 +225,32 @@ Safety:
         "--library-path",
         type=Path,
         default=None,
-        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()})",
+        help=f"Path to Serato master.sqlite (default: {get_default_serato_library_path()}). "
+             "The repairs go to the root.sqlite beside it. Name a copy to try a run on it",
     )
     fix_parser.add_argument(
         "--apply",
         action="store_true",
-        help="Actually write changes (default is dry-run). Refused when root.sqlite is beside "
-             "the library: on Serato 4.x and later a repair to master.sqlite alone can be lost",
+        help="Actually write the repairs to root.sqlite (default is dry-run). "
+             "Asks first; --yes skips the question",
+    )
+    fix_parser.add_argument(
+        "--yes", "-y",
+        action="store_true",
+        help="With --apply: do not ask before the write. Needed where there is no terminal",
     )
     fix_parser.add_argument(
         "--keep-orphans",
         action="store_true",
         help="Skip orphan rows instead of deleting them",
+    )
+    fix_parser.add_argument(
+        "--keep-backups",
+        type=_keep_backups,
+        default=KEEP_BACKUPS,
+        metavar="N",
+        help="After a write that succeeded, keep this tool's own backups of the newest N runs "
+             f"and remove its older ones (default: {KEEP_BACKUPS}). 'all' removes none",
     )
     fix_parser.add_argument(
         "--ambiguous-too",
@@ -465,23 +480,11 @@ Safety:
     elif args.command == "fix-paths":
         from .fix_paths import run_fix_paths
 
-        library_path = args.library_path
-        if library_path is None:
-            library_path = get_default_serato_library_path()
-        else:
-            library_path = library_path.expanduser().resolve()
-
-        # Serato 4.x and later keep the authoritative library in root.sqlite and
-        # rebuild master.sqlite from it, so a repair here alone can be lost.
-        # Checked beside the file being written, so a copy elsewhere can still be tried.
-        if args.apply and (library_path.parent / "root.sqlite").exists():
-            print(
-                f"fix-paths --apply refused: root.sqlite is beside {library_path}, so this is a "
-                "Serato 4.x or later library, and a repair to master.sqlite alone can be lost. "
-                "Nothing was written. See the caution at the top of fix-paths in docs/usage.md.",
-                file=sys.stderr,
-            )
-            return 1
+        # --library-path names a master.sqlite, as it does for diagnose and verify-paths.
+        # The repairs go to the root.sqlite beside it, with the backups and the
+        # manifest of that folder. Name a copy to try a run on it.
+        use_library_dir(args.library_path.expanduser().resolve().parent
+                        if args.library_path else None)
 
         csv_path = args.from_csv.expanduser().resolve()
         audit_log = args.audit_log
@@ -494,13 +497,14 @@ Safety:
             audit_log = audit_log.expanduser().resolve()
 
         return run_fix_paths(
-            library_path,
             csv_path,
             apply=args.apply,
             keep_orphans=args.keep_orphans,
             ambiguous_too=args.ambiguous_too,
             repair_only=args.repair_only,
             audit_log_path=audit_log,
+            keep_backups=args.keep_backups,
+            assume_yes=args.yes,
         )
 
     elif args.command == "verify-paths":

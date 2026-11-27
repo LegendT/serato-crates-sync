@@ -7,7 +7,7 @@ crate format) see [internals.md](internals.md).
 - [`sync`](#sync) — generate crates from a folder hierarchy
 - [`diagnose`](#diagnose) — read-only health snapshot
 - [`verify-paths`](#verify-paths) — locate broken asset paths
-- [`fix-paths`](#fix-paths) — apply repairs to `master.sqlite`
+- [`fix-paths`](#fix-paths) — apply repairs to `root.sqlite`
 - [`guide`](#guide) — print manual crate-creation instructions
 - [Verification checklist after `sync --apply`](#verification-checklist)
 - [Paths with spaces](#paths-with-spaces)
@@ -325,28 +325,41 @@ A search by name cannot follow a rename, but the record can. This mode
 cannot be combined with `--music-root`. With `--exclude`, a move into a
 folder of that name is skipped.
 
-On Serato 4.x and later, `fix-paths --apply` refuses to write these rows.
-See the caution at the top of [`fix-paths`](#fix-paths).
+`fix-paths --apply` writes these rows to `root.sqlite`. Read the caution
+at the top of [`fix-paths`](#fix-paths) first.
 
 ## `fix-paths`
 
-> **Caution, Serato 4.x and later.** `fix-paths` writes `master.sqlite`
-> only. On these versions, `root.sqlite` is the authoritative store and
-> `master.sqlite` is an aggregate of it (see internals.md). A repair from
-> `fix-paths` leaves `root.sqlite` unchanged, so the repair can be lost.
-> Whether Serato reverts it on launch is not measured.
+> **Caution: only partly measured in Serato.** `fix-paths --apply` writes
+> the repairs to `root.sqlite`, the store Serato 4.x and later read
+> changes from. What it writes was checked on a database with the real
+> schema of Serato 5.0. How Serato takes each kind of change up when it
+> starts:
 >
-> As a result, `fix-paths --apply` has a check. When a `root.sqlite` is
-> beside the library file, it refuses to run and writes nothing. A dry
-> run still works. Before this check, `--apply` on Serato 5.0 stopped at the
-> integrity check of the backup with this error: `no such collation
-> sequence: serato_asset_string_comparator`. It left the backup file
-> (`master.sqlite.BACKUP.<timestamp>`, as big as the library) beside the
-> library. A backup that fails its check is now deleted.
+> - A crate membership added to `root.sqlite` is copied into
+>   `master.sqlite`. Measured through `sync`, on Serato 4.x and 5.0.0,
+>   for crates that `sync` made. A merge adds memberships the same way,
+>   often to a crate you made: that case is not measured.
+> - A deleted entry (the broken half of a merge, and an orphan): carried
+>   over. Measured on Serato 5.0.0 on 27 November 2026: after two merges
+>   and one Serato launch, both deleted entries were gone from
+>   `master.sqlite`, and both kept copies were still in their crates, not
+>   missing. The same day 206 more merges gave the same result.
+> - A changed path: not measured.
 >
-> Serato Crates has no safe way to make these repairs on Serato 4.x and
-> later yet. On these versions, `path-fixes.csv` only records which
-> entries are broken and where each file is now.
+> So where a run moves crate memberships or changes a path, make it a
+> small one first. Cut `path-fixes.csv` down to two or three such rows,
+> apply, start Serato and look at those entries. To
+> undo a run, restore its three backups: see
+> [troubleshooting.md](troubleshooting.md#how-to-roll-back).
+>
+> Until 27 November 2026 `fix-paths` wrote `master.sqlite`. That writer
+> is gone. Two measured faults ended it: a merge there lost the crate
+> memberships it was meant to move, and on Serato 5.0 the file cannot be
+> checked or changed without Serato's own collation. A third reason is
+> inferred, not measured: Serato copies changes from `root.sqlite` into
+> `master.sqlite` when it starts, so a repair made to `master.sqlite`
+> alone may not hold.
 
 Applies the repairs from a `path-fixes.csv` produced by `verify-paths`.
 
@@ -358,34 +371,50 @@ serato-crates fix-paths --from-csv /tmp/serato-diag/path-fixes.csv
 serato-crates fix-paths --from-csv /tmp/serato-diag/path-fixes.csv --apply
 ```
 
+To try a run on a copy, copy the Serato library folder and name the
+`master.sqlite` of the copy with `--library-path`. The repairs go to
+the `root.sqlite` beside it, and the backups stay in that folder.
+
 ### Behaviour
 
-- Refuses to run with `--apply` if a `root.sqlite` is beside the library
-  (every Serato 4.x and later library: see the caution above), if Serato
-  DJ Pro is detected, if `PRAGMA foreign_keys` does not engage, or if
-  another writer holds the database lock.
-- Backs up `master.sqlite` to `master.sqlite.BACKUP.<timestamp>` via
-  SQLite's Backup API and runs `PRAGMA integrity_check` on the snapshot
-  before any writes.
-- Wraps everything in a single transaction; any error rolls back fully.
-- After commit, runs `PRAGMA wal_checkpoint(TRUNCATE)` so a downstream
-  copy of `master.sqlite` (without the `-wal`/`-shm` siblings) reflects
-  the fix.
-- For each broken row in the CSV:
-  - `auto` with proposed path **unclaimed**: UPDATE the row's path.
-  - `auto` with proposed path **already taken** by a healthy row:
-    re-parent the broken row's `container_asset` / `selection_asset`
-    memberships to the healthy row (skipping crates where the healthy
-    row is already a member), then DELETE the broken row.
-    **Known fault on Serato's real tables:** there the crate memberships
-    of the broken row are lost, not moved. A real `container_asset` row
-    also points at the row's `space_asset`, which is deleted with the
-    broken row and takes the membership with it. Measured on
-    27 November 2026 on the table shapes of Serato 4.x and 5.0. The
-    refusal above is what keeps this from a real library.
-  - `orphan`: DELETE the asset row (with `--keep-orphans` or
-    `--repair-only` to preserve). The play history of the track is kept,
-    as Serato keeps it when it deletes a track itself.
+- Works on a library that has a `root.sqlite` (Serato 4.x and later).
+  With none beside the library file it stops: there is nothing to repair.
+- It first makes a read-only pass that decides what each row would do.
+  That pass is the whole of a dry run. With `--apply`, a run with
+  nothing to change stops there: it makes no backup and writes no
+  audit log.
+- Asks before it writes, because a write deletes entries (the broken
+  half of each merge, and each orphan). `--yes` skips the question.
+  Without a terminal there is nobody to ask: the run is refused with
+  exit code 1 unless `--yes` is given.
+- Refuses `--apply` if Serato is detected, if `PRAGMA foreign_keys`
+  does not engage, or if `root.sqlite` is at a schema version these
+  writes have not been checked on. They were checked on version 203
+  (Serato 5.0.0) only. A Serato 4.x library (version 202) is refused,
+  although `sync` writes to it: a check of `sync` says nothing about
+  these writes.
+- Backs up `root.sqlite`, `master.sqlite` and the manifest under one
+  timestamp before any write, as `sync` does. After a write that
+  succeeded it keeps its own backups of the newest 3 runs
+  (`--keep-backups`).
+- Wraps everything in a single transaction, with `foreign_key_check`
+  and `quick_check` before the commit; any error rolls back fully.
+- An entry is found by its path, in either Unicode form and either
+  ASCII case. The `asset_id` column of the CSV is `master.sqlite`'s and
+  is not used. A row whose old path has no entry in `root.sqlite` is
+  skipped: it was repaired already, the CSV is older than the library,
+  or `master.sqlite` holds an entry that `root.sqlite` does not.
+- For each row in the CSV:
+  - `auto`, and the new path has no entry: the entry's path and file
+    name change. If the new path belongs to an entry outside the Serato
+    Library space, the row is skipped instead: a path is unique in
+    `root.sqlite`, and writing it would undo the whole run.
+  - `auto`, and the new path already has an entry (the kept copy): each
+    crate that holds the broken entry gets the kept copy in the same
+    place, unless the kept copy is already in that crate. Then the
+    broken entry is deleted.
+  - `orphan`: the entry is deleted, with its crate memberships (with
+    `--keep-orphans` or `--repair-only` to preserve).
   - `ambiguous`: skipped by default. With `--ambiguous-too`, applied
     using whatever path is in the CSV's `proposed_new_portable_id`
     column (only safe if you've reviewed the file).
@@ -398,14 +427,19 @@ serato-crates fix-paths --from-csv /tmp/serato-diag/path-fixes.csv --apply
 ### Flags
 
 - `--from-csv PATH` — required: the `path-fixes.csv` to read
-- `--library-path PATH` — the `master.sqlite` to work on (default: the
-  Serato library of this machine)
-- `--apply` — actually write (default is dry-run)
+- `--library-path PATH` — the `master.sqlite` of the library to work on
+  (default: the Serato library of this machine). The repairs go to the
+  `root.sqlite` beside it
+- `--apply` — actually write (default is dry-run). It asks first
+- `--yes`, `-y` — with `--apply`: do not ask. Needed where there is no
+  terminal
 - `--keep-orphans` — leave orphan rows alone
 - `--ambiguous-too` — trust the CSV's proposed path for ambiguous rows
 - `--repair-only` — only change the path of rows whose proposed path is
   unclaimed: no merges, and orphan rows are kept
 - `--audit-log PATH` — override the default audit CSV location
+- `--keep-backups N` — how many runs of the tool's own backups to keep
+  after a write (default 3), or `all`
 
 ### Audit log columns
 
@@ -417,11 +451,11 @@ in-progress copy is dropped on rollback, and left as
 | Column | Meaning |
 |---|---|
 | `applied_at` | UTC ISO-8601 timestamp of when the row was processed |
-| `asset_id` | The `asset.id` the CSV row refers to |
+| `asset_id` | The `asset_id` of the CSV row (`master.sqlite`'s; kept for tracing a row back to the CSV) |
 | `old_portable_id` | Path the row had before fix-paths touched it |
 | `proposed_new_portable_id` | Path verify-paths suggested (blank for orphans) |
 | `action` | One of `updated`, `merged`, `orphan_deleted`, or a `skipped_*` reason |
-| `merged_into_id` | For `merged` rows: the surviving healthy asset's id |
+| `merged_into_id` | For `merged` rows: the kept copy's `asset.id` in `root.sqlite` |
 
 ## `guide`
 
@@ -458,8 +492,8 @@ After running `sync --apply`, verify in Serato DJ Pro:
 
 For `fix-paths --apply` (read the caution at the top of [`fix-paths`](#fix-paths) first), the equivalent checks are:
 
-1. Re-run `serato-crates diagnose` — the total falls by the rows the run deleted and merged. The missing count of the rows whose path was changed stays as it was until Serato has looked at the files again: Serato sets that flag, and `fix-paths` does not change it (inferred, not measured).
-2. Open Serato — the warning triangles in your library should be gone for the rows the run repaired.
+1. Open Serato and look at the entries the run changed. Check whether the warning triangles are gone for them, and whether each crate holds the kept copy where the broken entry was. Neither is measured yet.
+2. Quit Serato, then re-run `serato-crates diagnose` and `verify-paths`. They read `master.sqlite`, which `fix-paths` does not write: it changes only when Serato has taken the repairs up, so the counts cannot fall before Serato has been started once. Whether they fall then is the measurement this tool does not have yet.
 
 ## Paths with spaces
 

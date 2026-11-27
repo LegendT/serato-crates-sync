@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`fix-paths --apply` writes `root.sqlite`.** It was refused on every
+  Serato 4.x and later library, because it wrote `master.sqlite`. It
+  now writes the store Serato reads changes from, under the rules of
+  `sync`: a yes before the write (`--yes` to skip it), Serato quit, the
+  three backups, one transaction, the integrity checks before the
+  commit. It has its own list of checked schema versions: 203 (Serato
+  5.0.0) only, so a Serato 4.x library is refused. A merge moves
+  each crate membership of the broken entry to the kept copy, in the
+  same place in the crate. What it writes was checked on a database
+  with the real schema of Serato 5.0. On Serato 5.0.0 an entry it
+  deletes is gone from Serato's list after one launch (measured with two
+  merges). How Serato takes a changed path, and a membership moved into
+  a crate the user made, is not yet measured: read the caution in
+  docs/usage.md.
+- `fix-paths` finds an entry by its path, in either Unicode form and
+  ASCII case. A row with no entry in `root.sqlite` is reported as
+  "skipped (not in root.sqlite)"; the old "skipped (CSV stale)" is gone.
+- `fix-paths` makes a read-only pass first. A run with nothing to
+  change makes no backup.
+- `fix-paths` skips a row whose new path belongs to an entry outside the
+  Serato Library space, where it would have failed the whole run.
+- New opt-in test, `tests/test_real_schema.py`: `fix-paths` on an empty
+  database built from the schema of a real `root.sqlite`.
+- `fix-paths --library-path` still names a `master.sqlite`; the repairs
+  go to the `root.sqlite` beside it. `fix-paths --keep-backups` is new.
+
+### Removed
+
+- The `fix-paths` writer of `master.sqlite`, with
+  `backup_serato_library` and `get_asset_referencing_columns`.
+  `run_fix_paths` no longer takes a library path: it works on the
+  folder `serato_db` is pointed at. On
+  Serato's real tables its merge lost the crate memberships it was
+  meant to move.
+
 ## [0.4.0] — 2026-11-27
 
 The version number is now set in one place, `src/serato_crates_sync/__init__.py`.

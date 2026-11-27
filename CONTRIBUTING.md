@@ -3,9 +3,9 @@
 Thanks for taking an interest. This project is small and the bar for
 contributions is low — the main thing is that changes are tested and
 keep the commands that write safe to run against real Serato libraries.
-Today that means `sync` on Serato 4.x and later (`serato_db.py`), the
-only code that writes a current library. `fix-paths --apply` refuses
-on those versions.
+Today that means `sync` (`serato_db.py`) and `fix-paths`
+(`fix_paths.py`), which both write `root.sqlite` on Serato 4.x and
+later.
 
 ## Setup
 
@@ -39,35 +39,45 @@ Tests live in `tests/` and follow the per-feature split of the source:
 - `test_diagnose.py` — read-only reporting against `master.sqlite`.
 - `test_verify_paths.py` — filesystem walk + candidate scoring +
   classification, and repairs from a record of moves.
-- `test_fix_paths.py` — repair logic, both the merge and orphan paths.
+- `test_fix_paths.py` — the repairs written to `root.sqlite`: path
+  change, merge, orphan, the skips, and the rules of a run that writes.
+- `test_real_schema.py` — the same repairs on an empty database built
+  from the schema of a real `root.sqlite`. Skipped unless you point it
+  at one (see below).
 - `test_library.py` — the shared helpers: the read-only open, the
   Serato-running check.
 - `test_cli_smoke.py` — end-to-end `main()` invocations per subcommand.
 - `test_public_api.py` — each module's `__all__`.
 
-Four synthetic SQLite schemas are defined in `tests/_schemas.py`. None
-is Serato's whole schema, and the first three are not its shape:
+Two cut-down schemas stand in for Serato's databases. Neither is
+Serato's whole schema:
 
-- `IDEALISED_SCHEMA` — every reference to `asset.id` has a formal
-  `FOREIGN KEY` with `ON DELETE CASCADE`. Tests the cascade path in
-  isolation.
-- `INFORMAL_SCHEMA` — `container_asset.asset_id` has no foreign key,
-  the one property of the real Serato shape that bit us in production.
-  The rest of it is simplified.
-- `REAL_SHAPE_LIBRARY_SQL` — `INFORMAL_SCHEMA`'s tables with the asset
-  columns the read-only commands query. Despite the name it is not the
-  real shape either.
-- `MASTER_SHAPE_SCHEMA` — the tables a repair touches, with the real
-  columns and foreign keys (read from a real library; the same in
-  schema versions 202 and 203). Use this one where the result depends
-  on how crate membership is stored.
+- `ROOT_SCHEMA` and `make_root_library` in `tests/test_serato_db.py` —
+  the `root.sqlite` that `sync` and `fix-paths` write. Its docstring
+  lists what it leaves out.
+- `REAL_SHAPE_LIBRARY_SQL` in `tests/_schemas.py` — the `asset` columns
+  of `master.sqlite` that `diagnose` and `verify-paths` read. Despite
+  the name it is not the real shape.
 
-`test_serato_db.py` has its own cut-down `root.sqlite` and
-`master.sqlite` fixtures; its docstring lists what they leave out.
+`test_serato_db.py` also has a small `master.sqlite` fixture for prune
+and clean.
+
+Serato's own schema is not in this repository. To run `fix-paths`
+against it, name a `root.sqlite`:
+
+```bash
+SERATO_CRATES_REAL_ROOT="$HOME/Library/Application Support/Serato/Library/root.sqlite" pytest tests/test_real_schema.py -q
+```
+
+The file is opened read-only and immutable, only its schema is read,
+and the test works on an empty database built from it in a temporary
+folder. Run it before you add a schema version to
+`CHECKED_SCHEMA_VERSIONS`.
 
 The smoke tests build a library inside `tmp_path`, seed a healthy and a
 broken asset, and exercise each subcommand via `main()`. No test may
-read the Serato library of the machine it runs on: a `sync` test pins
+read the Serato library of the machine it runs on by itself
+(`test_real_schema.py` does only when you name the file): a `sync` test pins
 `is_serato_4x` first, and a test that runs the engine through `main()`
 pins the default library folder as well, so that a broken option cannot
 send an `--apply` to the real one.
@@ -78,16 +88,17 @@ send an `--apply` to the real one.
 - Any change to what `serato_db.py` writes to `root.sqlite` or
   `master.sqlite`, or to which crates prune and clean pick → unit test
   in `test_serato_db.py`.
-- Any new `apply_fixes` branch → unit test in `test_fix_paths.py`
-  using `INFORMAL_SCHEMA`, or `MASTER_SHAPE_SCHEMA` where crate
-  membership is involved.
+- Any new `fix-paths` branch → unit test in `test_fix_paths.py`, on
+  the `root.sqlite` fixture, that reads the result back from the
+  database.
 - Any new safety rule → a test that fails when the rule is taken out.
   Check it: take the rule out, run the test, put the rule back.
 - Any new path-classification heuristic in `verify-paths` → unit test
   in `test_verify_paths.py`.
-- Any change to `master.sqlite` write logic → at minimum a unit test
-  asserting no dangling rows remain after the operation; ideally also
-  a smoke test running `fix-paths --apply` end-to-end.
+- Any change to what is written to `root.sqlite` or `master.sqlite` →
+  at minimum a unit test asserting no dangling rows remain after the
+  operation; ideally also a run against an empty database built from a
+  real Serato schema, as `docs/internals.md` records for `fix-paths`.
 
 ## Style
 
@@ -99,11 +110,11 @@ send an `--apply` to the real one.
 - Keep error handling at boundaries (user input, external APIs); trust
   framework guarantees and internal invariants.
 
-## Safety expectations for `fix-paths`
+## Safety expectations for the commands that write
 
-`sync` on Serato 4.x and later writes `root.sqlite`, the store Serato
-reads changes from, and `--prune` / `--clean` write `master.sqlite` as
-well. `fix-paths --apply` writes `master.sqlite`. The canonical list of
+`sync` and `fix-paths` on Serato 4.x and later write `root.sqlite`, the
+store Serato reads changes from, and `sync --prune` / `--clean` write
+`master.sqlite` as well. The canonical list of
 invariants new contributions must preserve, for each of them, lives in
 [SECURITY.md](SECURITY.md#safety-expectations) — regressions in any of
 them are treated as security issues.
@@ -112,15 +123,9 @@ The version number is set in `src/serato_crates_sync/__init__.py` and
 nowhere else.
 
 `sync --apply` writes only to the schema versions listed in
-`MEASURED_SCHEMA_VERSIONS` in `serato_db.py`. Add a version there once a
-sync has been checked on that Serato release, and add what was seen to
-the table in [docs/internals.md](docs/internals.md#what-the-statements-about-serato-rest-on).
-
-One contributor-only note: `get_asset_referencing_columns()` decides
-which tables need dangling-row cleanup. It reads the schema at run
-time, so there is no list to keep up: it finds every column with a
-foreign key to `asset(id)` (left to the engine) and every column named
-`asset_id` without one (cleaned up by hand, like
-`container_asset.asset_id` and the `anonymous_table_*` sort caches in
-real Serato schemas). A reference to an asset under any other column
-name, with no foreign key, is missed.
+`MEASURED_SCHEMA_VERSIONS` in `serato_db.py`, and `fix-paths --apply`
+only to those in `CHECKED_SCHEMA_VERSIONS` in `fix_paths.py`. The lists
+are separate on purpose: a check of one command says nothing about the
+writes of the other. Add a version to a list once that command has been
+checked on that Serato release, and add what was seen to the table in
+[docs/internals.md](docs/internals.md#what-the-statements-about-serato-rest-on).

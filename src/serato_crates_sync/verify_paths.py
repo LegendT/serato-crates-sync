@@ -13,8 +13,9 @@ new path exists becomes an ``auto`` row. A search by filename cannot
 follow a rename, and can pick the wrong one of several same-named copies;
 the job's own record has neither fault.
 
-On Serato 4.x and later nothing in this tool can apply the rows yet:
-see the caution at the top of ``fix-paths`` in docs/usage.md.
+``fix-paths`` applies the rows to ``root.sqlite``. How Serato takes them
+up is only partly measured: see the caution at the top of ``fix-paths``
+in docs/usage.md.
 """
 
 import csv
@@ -45,8 +46,8 @@ __all__ = [
 ]
 
 # Printed under every repair file, whichever mode wrote it.
-CAUTION_4X = ("On Serato 4.x and later, fix-paths --apply refuses to write these repairs: "
-              "see the caution at the top of fix-paths in docs/usage.md.")
+CAUTION_4X = ("fix-paths --apply writes these repairs to root.sqlite. How Serato takes them up "
+              "is only partly measured: read the caution at the top of fix-paths in docs/usage.md first.")
 
 # The columns fix-paths reads. One list for both writers, so they cannot drift apart.
 FIX_COLUMNS = [

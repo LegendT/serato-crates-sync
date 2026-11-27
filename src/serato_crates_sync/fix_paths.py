@@ -1,36 +1,72 @@
-"""Apply asset-path repairs from a verify-paths CSV.
+"""Apply asset-path repairs from a verify-paths CSV to ``root.sqlite``.
 
-For each broken asset row in the input CSV, either updates the path
-(when the proposed target is unclaimed), merges the row into an
-existing healthy duplicate (re-parenting crate memberships first), or
-deletes the row outright (orphan with no replacement file). All
-transitions are bracketed by a backup, foreign-key enforcement, write
-lock acquisition, single transaction, and a WAL checkpoint after
-commit.
+``verify-paths`` lists the library entries whose file has moved. For each
+one this module either changes the entry's path (the new path has no
+entry yet), merges it into the entry the new path already has (its crate
+memberships move first), or deletes it (an orphan: no file to point at).
+
+It writes ``root.sqlite``, the store Serato 4.x and later read changes
+from, under the same rules as ``sync``: Serato quit, a schema version the
+tool has been checked on, a backup of both databases and the manifest,
+one transaction, and the integrity checks before the commit.
+
+Until 27 November 2026 it wrote ``master.sqlite``. Two measured faults
+ended that: crate membership there also runs through ``space_asset``, so
+a merge lost the memberships it was meant to move, and on Serato 5.0 a
+connection without Serato's own collation cannot check or change the
+file. A third reason is inferred, not measured: Serato copies changes
+from ``root.sqlite`` into ``master.sqlite`` when it starts, so a repair
+made to ``master.sqlite`` alone may not hold. That writer is gone.
+
+How Serato takes these changes up when it starts. Measured: an entry
+deleted here is gone from ``master.sqlite`` after one launch (Serato
+5.0.0, 27 November 2026, two merges). ``sync`` adds crate memberships to
+``root.sqlite`` in crates it made, and Serato copies those into
+``master.sqlite`` (Serato 4.x and 5.0.0). Not measured: a membership
+added to a crate the DJ made, and a changed path. See the caution at the
+top of ``fix-paths`` in docs/usage.md.
 """
 
 import csv
 import sqlite3
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .library import (
-    SAFE_IDENT,
-    connect_serato_library_readonly,
-    is_serato_running,
-    logger,
+from .library import is_serato_running, logger
+from .serato_db import (
+    KEEP_BACKUPS,
+    Anchors,
+    _asset_key,
+    _IdAllocator,
+    _make_backups,
+    _print_backups_to_remove,
+    _remove_old_backups,
+    _untested_schema,
+    assert_serato_4x_schema,
+    bump_revision,
+    discover_anchors,
+    get_master_db_path,
+    get_root_db_path,
+    validate_integrity,
 )
 
 __all__ = [
+    "CHECKED_SCHEMA_VERSIONS",
     "FixStats",
-    "backup_serato_library",
-    "get_asset_referencing_columns",
     "apply_fixes",
     "print_fix_stats",
     "run_fix_paths",
 ]
+
+
+# The schema versions of root.sqlite on which what fix-paths writes has been
+# checked: 203 (Serato 5.0.0), on an empty database built from the real schema.
+# It has its own set because a check of sync says nothing about these writes.
+# 202 (Serato 4.x) is not in it: no real 202 schema was left to check on.
+CHECKED_SCHEMA_VERSIONS = frozenset({203})
 
 
 @dataclass
@@ -39,136 +75,67 @@ class FixStats:
     total_csv_rows: int = 0
     updated: int = 0
     merged: int = 0
+    memberships_moved: int = 0
     orphans_deleted: int = 0
     skipped_ambiguous: int = 0
     skipped_keep_orphans: int = 0
     skipped_no_proposal: int = 0
     skipped_repair_only_merge: int = 0
-    skipped_stale_csv: int = 0
+    skipped_not_in_root: int = 0
+    skipped_target_outside_library: int = 0
     skipped_unknown_confidence: int = 0
 
+    @property
+    def changes(self) -> int:
+        """Rows that change root.sqlite."""
+        return self.updated + self.merged + self.orphans_deleted
 
-def backup_serato_library(library_path: Path) -> Path:
-    """Create a clean snapshot of master.sqlite via SQLite's Backup API.
 
-    Using the Backup API (rather than copying the file) yields a consistent
-    snapshot regardless of whether the WAL has been checkpointed. The
-    snapshot is then opened and run through PRAGMA integrity_check so a
-    silent disk error doesn't hand us a corrupt backup we'd only notice
-    at rollback time.
+def _load_assets(
+    conn: sqlite3.Connection, space_id: int,
+) -> tuple[dict[bytes, tuple[int, int]], set[bytes]]:
+    """Every track of the space, ``_asset_key(portable_id) -> (asset id, space_asset id)``,
+    and the paths of the entries of root.sqlite that are not in the space.
+
+    One query each and a dict, not a lookup for each CSV row. The key folds
+    Unicode form and ASCII case, as the unique index on asset.portable_id
+    does, so a path is found whichever form the CSV has it in.
+
+    The second set is for one check. asset.portable_id is unique across the
+    whole file, so a path held by an entry of another space cannot be given
+    to a second entry, and that entry cannot be merged into either: its
+    crates are not in this space. (The library measured on 27 November 2026
+    has no such entry.)
     """
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    backup_path = library_path.parent / f"{library_path.name}.BACKUP.{timestamp}"
-
-    # timeout so we don't hang forever if Serato slipped past pgrep and
-    # has the database locked.
-    src = sqlite3.connect(str(library_path), timeout=10.0)
-    try:
-        dst = sqlite3.connect(str(backup_path), timeout=10.0)
-        try:
-            src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
-
-    try:
-        verify = sqlite3.connect(str(backup_path))
-        try:
-            result = verify.execute("PRAGMA integrity_check").fetchone()
-        finally:
-            verify.close()
-        if not result or result[0] != "ok":
-            raise RuntimeError(
-                f"Backup integrity_check failed: {result!r}. "
-                f"Refusing to proceed with --apply."
-            )
-    except (sqlite3.Error, RuntimeError):
-        # A snapshot that failed its check is no backup. It is as big as the
-        # library, so it is not left behind (it was, before 27 November 2026).
-        backup_path.unlink()
-        raise
-
-    return backup_path
-
-
-def get_asset_referencing_columns(
-    conn: sqlite3.Connection,
-) -> list[tuple[str, str, bool]]:
-    """Find every column referencing asset.id (formal or informal).
-
-    Returns triples ``(table, column, has_fk)``. The third flag is True
-    when the column has a FOREIGN KEY to asset.id, whatever its ON DELETE
-    action: the engine then deals with the dependent rows on a
-    ``DELETE FROM asset`` and fix-paths leaves them to it. False means the
-    reference is informal (a column named asset_id with no FK), and
-    fix-paths must DELETE the leftover dependent rows itself.
-
-    The action matters. Serato's ``history_entry.asset_id`` is ON DELETE
-    SET NULL (seen in schema versions 202 and 203): Serato keeps the play
-    history of a deleted track. Deleting those rows by hand, as this code
-    did before 27 November 2026, erased that history.
-
-    Real Serato schemas have asset_id columns with NO foreign key on
-    several important tables (container_asset, anonymous_table_0/1/2,
-    static_selection_asset). Trusting only formal FKs leaves dangling
-    rows behind on asset DELETE and triggers Serato's "Operation failed"
-    error on next launch.
-    """
-    refs: list[tuple[str, str, bool]] = []
-    cur = conn.cursor()
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
-    tables = [r[0] for r in cur.fetchall()]
-    for t in tables:
-        if t == "asset" or not SAFE_IDENT.match(t):
-            continue
-
-        fk_cols: set[str] = set()
-        for fk in cur.execute(f"PRAGMA foreign_key_list({t})").fetchall():
-            # fk: (id, seq, table, from, to, on_update, on_delete, match)
-            if fk[2] == "asset" and fk[4] == "id" and SAFE_IDENT.match(fk[3]):
-                fk_cols.add(fk[3])
-                refs.append((t, fk[3], True))
-
-        for col in cur.execute(f"PRAGMA table_info({t})").fetchall():
-            cname = col[1]
-            if cname == "asset_id" and SAFE_IDENT.match(cname) and cname not in fk_cols:
-                refs.append((t, cname, False))
-    return refs
-
-
-def _load_asset_maps(
-    conn: sqlite3.Connection,
-) -> tuple[dict[int, str], dict[tuple[int, str], int]]:
-    """Snapshot the asset table into two in-memory lookup dicts.
-
-    Per-row SQL lookups are catastrophically slow for an 800k-row CSV
-    because asset's UNIQUE index on (location_id, portable_id) uses
-    COLLATE NOCASE, so a default-collation equality filter falls back
-    to a full scan. One up-front SELECT plus dict lookups is orders of
-    magnitude faster, and tolerates contention from a running Serato
-    much better.
-    """
-    id_to_portable: dict[int, str] = {}
-    path_to_id: dict[tuple[int, str], int] = {}
-    for asset_id, loc_id, pid in conn.execute(
-        "SELECT id, location_id, portable_id FROM asset"
-    ):
-        id_to_portable[asset_id] = pid
-        # Lowercase key mirrors the COLLATE NOCASE uniqueness Serato uses
-        path_to_id[(loc_id, pid.lower())] = asset_id
-    return id_to_portable, path_to_id
+    in_space = {
+        _asset_key(pid): (asset_id, sa_id)
+        for asset_id, sa_id, pid in conn.execute(
+            "SELECT a.id, sa.id, a.portable_id FROM asset a "
+            "JOIN space_asset sa ON sa.asset_id = a.id WHERE sa.space_id = ?",
+            (space_id,),
+        )
+    }
+    elsewhere = {
+        _asset_key(pid) for (pid,) in conn.execute(
+            "SELECT portable_id FROM asset WHERE id NOT IN "
+            "(SELECT asset_id FROM space_asset WHERE space_id = ?)",
+            (space_id,),
+        )
+    }
+    return in_space, elsewhere
 
 
 def _process_fix_row(
     conn: sqlite3.Connection,
     row: dict,
-    ref_columns: list[tuple[str, str, bool]],
     stats: FixStats,
     audit_writer,
-    id_to_portable: dict[int, str],
-    path_to_id: dict[tuple[int, str], int],
+    assets: dict[bytes, tuple[int, int]],
+    elsewhere: set[bytes],
+    ids: _IdAllocator,
+    moved: dict[int, set[int]],
     *,
+    revision: int,
     apply: bool,
     keep_orphans: bool,
     ambiguous_too: bool,
@@ -176,12 +143,11 @@ def _process_fix_row(
 ) -> None:
     """Apply (or dry-run) a single CSV row of repair instructions.
 
-    Maintains the in-memory maps as it goes so later rows see the
-    consequences of earlier rows (path freed by a delete, claimed by
-    an update, etc.).
+    Keeps ``assets`` and ``moved`` in step as it goes, so later rows see
+    what earlier rows did (a path freed by a delete, claimed by an update,
+    a crate the kept copy has already been put in) whether or not anything
+    is written. A dry run then counts exactly what the write does.
     """
-    asset_id = int(row["asset_id"])
-    location_id = int(row["location_id"])
     old_path = row["old_portable_id"]
     proposed = row.get("proposed_new_portable_id", "")
     confidence = row["confidence"]
@@ -190,37 +156,32 @@ def _process_fix_row(
         if audit_writer is not None:
             audit_writer.writerow([
                 datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                asset_id, old_path, proposed, action, merged_into,
+                row.get("asset_id", ""), old_path, proposed, action, merged_into,
             ])
 
-    # Sanity check: the broken row must still exist with the path we recorded.
-    actual = id_to_portable.get(asset_id)
-    if actual is None or actual != old_path:
-        stats.skipped_stale_csv += 1
-        log("skipped_stale_csv")
+    # The entry is found by its path. The CSV's asset_id is master.sqlite's and
+    # means nothing in root.sqlite. No entry here: already repaired, a CSV older
+    # than the library, or an entry master.sqlite holds that the Serato Library
+    # space of root.sqlite does not.
+    old_key = _asset_key(old_path)
+    held = assets.get(old_key)
+    if held is None:
+        stats.skipped_not_in_root += 1
+        log("skipped_not_in_root")
         return
+    asset_id, sa_id = held
 
     if confidence == "orphan":
-        # --repair-only promises path UPDATEs and nothing else, so it keeps
-        # orphans too. Before 27 November 2026 it deleted them.
+        # --repair-only promises path changes and nothing else, so it keeps orphans too.
         if keep_orphans or repair_only:
             stats.skipped_keep_orphans += 1
             log("skipped_keep_orphans")
             return
         if apply:
-            # Manually remove rows in informal asset_id columns (no FK).
-            # Tables with an FK are left to the engine on the asset DELETE
-            # below: it cascades, or sets NULL, as the schema says.
-            for table, column, has_fk in ref_columns:
-                if not has_fk:
-                    conn.execute(
-                        f"DELETE FROM {table} WHERE {column} = ?",
-                        (asset_id,),
-                    )
+            # space_asset, container_asset, dj_asset_metadata and asset_auxiliary
+            # all cascade from asset in root.sqlite.
             conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
-        # Update maps either way so dry-run stats stay consistent
-        id_to_portable.pop(asset_id, None)
-        path_to_id.pop((location_id, old_path.lower()), None)
+        del assets[old_key]
         stats.orphans_deleted += 1
         log("orphan_deleted")
         return
@@ -240,64 +201,78 @@ def _process_fix_row(
         log("skipped_no_proposal")
         return
 
-    existing_id = path_to_id.get((location_id, proposed.lower()))
-    if existing_id == asset_id:
-        # The proposed path differs from the row's own only by letter case
-        # (the stale-CSV check above rules out anything else). That is a
-        # rename of this row, not a merge with another: take the UPDATE branch.
-        existing_id = None
+    new_key = _asset_key(proposed)
+    kept = assets.get(new_key)
 
-    if existing_id is None:
+    if kept is None and new_key in elsewhere:
+        # The new path belongs to an entry outside the Serato Library space (see
+        # _load_assets). Writing it would break the unique index and roll back
+        # every other repair of the run, so this row is left for a person.
+        stats.skipped_target_outside_library += 1
+        log("skipped_target_outside_library")
+        return
+
+    if kept is None or kept[0] == asset_id:
+        # The new path has no entry of its own (or only this one, in another
+        # letter case or Unicode form): change this entry's path.
         if apply:
+            # file_name too: in every one of the 453,938 rows of the real library
+            # (27 November 2026) it is the last part of portable_id.
             conn.execute(
-                "UPDATE asset SET portable_id = ? WHERE id = ?",
-                (proposed, asset_id),
+                "UPDATE asset SET portable_id = ?, file_name = ?, revision = ? WHERE id = ?",
+                (proposed, proposed.rsplit("/", 1)[-1], revision, asset_id),
             )
-        # Maintain maps
-        id_to_portable[asset_id] = proposed
-        path_to_id.pop((location_id, old_path.lower()), None)
-        path_to_id[(location_id, proposed.lower())] = asset_id
+        del assets[old_key]
+        assets[new_key] = (asset_id, sa_id)
         stats.updated += 1
         log("updated")
         return
 
     if repair_only:
         stats.skipped_repair_only_merge += 1
-        log("skipped_repair_only_merge", str(existing_id))
+        log("skipped_repair_only_merge", str(kept[0]))
         return
 
-    if apply:
-        for table, column, has_fk in ref_columns:
-            # UPDATE OR IGNORE: re-parent the row to the healthy asset
-            # where possible. If the dependent table has a UNIQUE on
-            # (other_id, asset_id) and the healthy id is already present,
-            # the broken-side row is left alone here.
+    # Merge. The new path already has an entry: the kept copy. Each crate that
+    # holds the broken entry gets the kept copy in its place, unless it is
+    # already there. A membership is a container_asset row that points at the
+    # track's space_asset. The new row is an INSERT, as sync makes them: Serato
+    # has been seen to copy those into master.sqlite for crates sync made, not
+    # yet for a crate the DJ made. It keeps the old row's place in the crate.
+    # The broken entry is then deleted, and its own membership rows go with it
+    # by cascade.
+    kept_sa = kept[1]
+    already_in = moved.setdefault(kept_sa, set())
+    already_in.update(r[0] for r in conn.execute(
+        "SELECT container_id FROM container_asset WHERE space_asset_id = ?", (kept_sa,)))
+    for container_id, list_order, time_added in conn.execute(
+        "SELECT container_id, list_order, time_added FROM container_asset "
+        "WHERE space_asset_id = ? ORDER BY id", (sa_id,),
+    ).fetchall():
+        if container_id in already_in:
+            continue
+        already_in.add(container_id)
+        stats.memberships_moved += 1
+        if apply:
             conn.execute(
-                f"UPDATE OR IGNORE {table} SET {column} = ? WHERE {column} = ?",
-                (existing_id, asset_id),
+                "INSERT INTO container_asset (id, revision, container_id, space_asset_id, "
+                "list_order, time_added) VALUES (?, ?, ?, ?, ?, ?)",
+                (ids.take("container_asset"), revision, container_id, kept_sa,
+                 list_order, time_added),
             )
-            if not has_fk:
-                # No CASCADE will sweep up the rows UPDATE OR IGNORE
-                # skipped — delete them explicitly so the asset DELETE
-                # doesn't leave dangling references that crash Serato's
-                # next library scan.
-                conn.execute(
-                    f"DELETE FROM {table} WHERE {column} = ?",
-                    (asset_id,),
-                )
+    if apply:
         conn.execute("DELETE FROM asset WHERE id = ?", (asset_id,))
-    # Maintain maps
-    id_to_portable.pop(asset_id, None)
-    path_to_id.pop((location_id, old_path.lower()), None)
-    # The (location_id, proposed_lower) -> existing_id mapping stays as-is.
+    del assets[old_key]
     stats.merged += 1
-    log("merged", str(existing_id))
+    log("merged", str(kept[0]))
 
 
 def apply_fixes(
     conn: sqlite3.Connection,
     csv_path: Path,
+    anchors: Anchors,
     *,
+    revision: int,
     apply: bool,
     keep_orphans: bool,
     ambiguous_too: bool,
@@ -305,13 +280,18 @@ def apply_fixes(
     audit_log_path: Path | None,
     progress_every: int = 50000,
 ) -> FixStats:
-    """Stream the path-fixes CSV and apply each row's repair (or dry-run)."""
-    stats = FixStats()
-    ref_columns = get_asset_referencing_columns(conn)
+    """Stream the path-fixes CSV and apply each row's repair to root.sqlite (or dry-run).
 
-    print("  loading asset table into memory...")
-    id_to_portable, path_to_id = _load_asset_maps(conn)
-    print(f"  loaded {len(id_to_portable):,} assets")
+    For a write, ``conn`` is inside a transaction and ``revision`` is the
+    number ``bump_revision`` returned: every row written is stamped with it.
+    """
+    stats = FixStats()
+
+    print("  loading the library's tracks into memory...")
+    assets, elsewhere = _load_assets(conn, anchors.space_id)
+    print(f"  loaded {len(assets):,} tracks")
+    ids = _IdAllocator(conn, ["container_asset"])
+    moved: dict[int, set[int]] = {}   # kept copy's space_asset id -> crates it is in by now
 
     audit_file = None
     audit_writer = None
@@ -323,8 +303,7 @@ def apply_fixes(
             "proposed_new_portable_id", "action", "merged_into_id",
         ])
 
-    # Pre-count the CSV so we can show an ETA. Cheap compared to the work
-    # we're about to do (loading asset maps, then per-row processing).
+    # Pre-count the CSV so we can show an ETA.
     with csv_path.open(encoding="utf-8") as f:
         total_rows = max(0, sum(1 for _ in f) - 1)  # subtract header
 
@@ -332,12 +311,11 @@ def apply_fixes(
     next_progress = progress_every
     try:
         with csv_path.open(encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
+            for row in csv.DictReader(f):
                 stats.total_csv_rows += 1
                 _process_fix_row(
-                    conn, row, ref_columns, stats, audit_writer,
-                    id_to_portable, path_to_id,
+                    conn, row, stats, audit_writer, assets, elsewhere, ids, moved,
+                    revision=revision,
                     apply=apply,
                     keep_orphans=keep_orphans,
                     ambiguous_too=ambiguous_too,
@@ -364,30 +342,40 @@ def apply_fixes(
         if audit_file is not None:
             audit_file.close()
 
+    if apply and stats.changes:
+        # Advance the space's revision, with the statement root.sqlite's own
+        # triggers use. Those triggers do it for an added or removed membership,
+        # but a changed path fires none of them, so it is done here for every run.
+        conn.execute(
+            "UPDATE space SET revision = ? WHERE id = ? AND revision < ?",
+            (revision, anchors.space_id, revision),
+        )
+
     return stats
 
 
-def print_fix_stats(stats: FixStats, dry_run: bool) -> None:
+def print_fix_stats(stats: FixStats, dry_run: bool, label: str | None = None) -> None:
     """Print a summary of the fix-paths run."""
-    label = "DRY-RUN" if dry_run else "APPLIED"
+    label = label or ("DRY-RUN" if dry_run else "APPLIED")
     print(f"\n{'='*60}")
     print(f"FIX-PATHS {label}")
     print(f"{'='*60}")
     print(f"CSV rows processed:               {stats.total_csv_rows:>10,}")
     print(f"  paths updated:                  {stats.updated:>10,}")
     print(f"  rows merged into existing:      {stats.merged:>10,}")
+    print(f"    crate memberships moved:      {stats.memberships_moved:>10,}")
     print(f"  orphans deleted:                {stats.orphans_deleted:>10,}")
     print(f"  skipped (ambiguous):            {stats.skipped_ambiguous:>10,}")
     print(f"  skipped (kept orphans):         {stats.skipped_keep_orphans:>10,}")
     print(f"  skipped (no proposed path):     {stats.skipped_no_proposal:>10,}")
     print(f"  skipped (repair-only blocked merge): {stats.skipped_repair_only_merge:>5,}")
-    print(f"  skipped (CSV stale):            {stats.skipped_stale_csv:>10,}")
+    print(f"  skipped (not in root.sqlite):   {stats.skipped_not_in_root:>10,}")
+    print(f"  skipped (new path held outside the library): {stats.skipped_target_outside_library:,}")
     print(f"  skipped (unknown confidence):   {stats.skipped_unknown_confidence:>10,}")
     print(f"{'='*60}\n")
 
 
 def run_fix_paths(
-    library_path: Path,
     csv_path: Path,
     *,
     apply: bool,
@@ -395,123 +383,145 @@ def run_fix_paths(
     ambiguous_too: bool,
     repair_only: bool,
     audit_log_path: Path | None,
+    keep_backups: int | None = KEEP_BACKUPS,
+    assume_yes: bool = False,
 ) -> int:
-    """Apply (or dry-run) repairs from a path-fixes.csv against master.sqlite."""
-    if not library_path.exists():
-        logger.error(f"Serato library not found: {library_path}")
+    """Apply (or dry-run) repairs from a path-fixes.csv to root.sqlite. Returns exit code.
+
+    A run that writes asks first, as a removal in ``sync`` does, unless
+    ``assume_yes``. With nobody to ask it is refused.
+
+    The library folder is the one ``serato_db`` is pointed at: this
+    machine's, or the folder set with ``serato_db.use_library_dir``.
+    """
+    root_db = get_root_db_path()
+    if not root_db.exists():
+        logger.error(
+            f"No root.sqlite at {root_db}. fix-paths repairs the library of Serato 4.x and "
+            "later, which is in root.sqlite."
+        )
         return 1
     if not csv_path.exists():
         logger.error(f"Path-fixes CSV not found: {csv_path}")
         return 1
 
     if apply and is_serato_running():
-        logger.error(
-            "Serato DJ Pro appears to be running. Quit it (Cmd+Q) and rerun."
-        )
+        logger.error("Serato is running. Quit it (Cmd+Q) and rerun. Nothing was written.")
         return 1
 
-    # Resolve where the audit log will eventually live, plus a tmp file
-    # we'll atomic-rename onto it after a successful commit so a kill or
-    # rollback never leaves a stale audit log claiming work that didn't
-    # actually persist.
-    audit_tmp_path: Path | None = None
-    if audit_log_path is not None:
-        if apply:
-            audit_tmp_path = audit_log_path.with_name(
-                audit_log_path.name + ".inprogress"
+    # First a read-only pass that makes the same decisions and writes nothing to
+    # the library. It is the whole of a dry run, and for --apply it says whether
+    # there is anything to write before the backups are made.
+    try:
+        ro = sqlite3.connect(f"{root_db.as_uri()}?mode=ro", uri=True, timeout=60)
+        try:
+            ro.execute("PRAGMA busy_timeout=5000")
+            assert_serato_4x_schema(ro)
+            refusal = _untested_schema(ro, CHECKED_SCHEMA_VERSIONS, "fix-paths")
+            anchors = discover_anchors(ro)
+            preview = apply_fixes(
+                ro, csv_path, anchors, revision=0, apply=False,
+                keep_orphans=keep_orphans, ambiguous_too=ambiguous_too,
+                repair_only=repair_only,
+                audit_log_path=None if apply else audit_log_path,
             )
-        else:
-            # Dry-run: nothing to roll back, write directly.
-            audit_tmp_path = audit_log_path
+        finally:
+            ro.close()
+    except KeyError as e:
+        logger.error(f"{csv_path.name} has no column {e}: it is not a path-fixes.csv from verify-paths.")
+        return 1
+    except (ValueError, sqlite3.Error) as e:
+        logger.error(f"fix-paths failed: {e}")
+        return 1
 
-    if apply:
-        print("Preflight:")
-        backup = backup_serato_library(library_path)
-        print(f"  [ok] backup created  {backup}")
-        # isolation_level=None lets us drive transactions explicitly so a single
-        # BEGIN IMMEDIATE ... COMMIT spans the whole run and rolls back
-        # atomically on error.
-        conn = sqlite3.connect(str(library_path), isolation_level=None)
+    if not apply:
+        print_fix_stats(preview, dry_run=True)
+        if audit_log_path is not None:
+            print(f"Dry-run report (nothing was written to the library): {audit_log_path}")
+        if refusal:
+            print(f"With --apply this is refused: {refusal}")
+        elif preview.changes:
+            _print_backups_to_remove(keep_backups)
+        return 0
+
+    if refusal:
+        logger.error(f"fix-paths refused, nothing was written: {refusal}")
+        return 1
+    if not preview.changes:
+        print_fix_stats(preview, dry_run=False, label="NOTHING TO WRITE")
+        print("Nothing to write: root.sqlite is unchanged, no backup was made and no audit log "
+              "was written.")
+        return 0
+
+    # A write deletes library entries (the broken half of each merge, and each
+    # orphan), so it asks first, as a removal in sync does.
+    if not assume_yes:
+        if not sys.stdin.isatty():
+            logger.error("fix-paths --apply needs a yes — re-run with --yes to proceed "
+                         "non-interactively. Nothing was written.")
+            return 1
+        print_fix_stats(preview, dry_run=True)
+        question = (f"Change {preview.updated} path(s), merge {preview.merged} entr(ies) into "
+                    f"their kept copies and delete {preview.orphans_deleted} orphan(s) in "
+                    "root.sqlite? [y/N] ")
+        if input(question).strip().lower() not in ("y", "yes"):
+            print("Aborted — nothing written.")
+            return 0
+
+    # The audit log goes to a .inprogress file and takes its final name only
+    # after the commit, so a failed or killed run leaves no record of work
+    # that did not happen.
+    audit_tmp = (audit_log_path.with_name(audit_log_path.name + ".inprogress")
+                 if audit_log_path is not None else None)
+    conn = sqlite3.connect(root_db, timeout=60)
+    conn.isolation_level = None  # explicit transaction control
+    try:
         conn.execute("PRAGMA foreign_keys = ON")
-        # Verify FK enforcement actually engaged. SQLite silently no-ops
-        # unsupported pragmas; if we proceeded without it the foreign-key
-        # actions we rely on (CASCADE on selection_asset, dj_asset_metadata
-        # and space_asset; SET NULL on history_entry) would not fire and
-        # we'd leak hundreds of thousands of dangling rows.
+        # The merge and the orphan delete rely on ON DELETE CASCADE. SQLite
+        # accepts the pragma without a word where it cannot enforce it. Checked
+        # before the backups, so that "nothing was written" is true.
         fk_state = conn.execute("PRAGMA foreign_keys").fetchone()
         if not fk_state or fk_state[0] != 1:
-            conn.close()
-            logger.error(
-                "PRAGMA foreign_keys did not engage (got %r). "
-                "This SQLite build cannot enforce ON DELETE CASCADE; "
-                "refusing to proceed.",
-                fk_state,
-            )
+            logger.error("PRAGMA foreign_keys did not engage: this SQLite cannot enforce "
+                         "ON DELETE CASCADE. Nothing was written.")
             return 1
-        print("  [ok] foreign-key enforcement engaged")
-        # BEGIN IMMEDIATE acquires the write lock right away. If another
-        # process (Serato that pgrep missed, a stray shell, etc.) holds
-        # it, we get SQLITE_BUSY here rather than corrupting later.
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-        except sqlite3.OperationalError as e:
-            conn.close()
-            logger.error(
-                "Could not acquire write lock on master.sqlite (%s). "
-                "Another process — most likely Serato — is using it. "
-                "Quit Serato (Cmd+Q) and rerun.",
-                e,
-            )
-            return 1
-        print("  [ok] write lock acquired\n")
-    else:
-        conn = connect_serato_library_readonly(library_path)
 
-    try:
         try:
-            stats = apply_fixes(
-                conn, csv_path,
-                apply=apply,
-                keep_orphans=keep_orphans,
-                ambiguous_too=ambiguous_too,
-                repair_only=repair_only,
-                audit_log_path=audit_tmp_path,
-            )
-        except Exception:
-            if apply:
-                conn.execute("ROLLBACK")
-                if audit_tmp_path is not None and audit_tmp_path.exists():
-                    audit_tmp_path.unlink()
-            raise
-        if apply:
-            conn.execute("COMMIT")
-            # Persist WAL into the main file so a downstream copy of
-            # master.sqlite (without -wal/-shm) still reflects the fix.
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            # Audit log atomically becomes visible at its final path only
-            # after commit succeeds.
-            if (
-                audit_tmp_path is not None
-                and audit_log_path is not None
-                and audit_tmp_path != audit_log_path
-                and audit_tmp_path.exists()
-            ):
-                audit_tmp_path.replace(audit_log_path)
+            ts = _make_backups(root_db, get_master_db_path())
+        except (OSError, sqlite3.Error) as e:
+            logger.error(f"Backup failed, so nothing was written: {e}")
+            return 1
+
+        conn.execute("BEGIN IMMEDIATE")
+        revision = bump_revision(conn)
+        stats = apply_fixes(
+            conn, csv_path, anchors, revision=revision, apply=True,
+            keep_orphans=keep_orphans, ambiguous_too=ambiguous_too,
+            repair_only=repair_only, audit_log_path=audit_tmp,
+        )
+        validate_integrity(conn, quick=True)
+        conn.execute("COMMIT")
+    except Exception as e:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        if audit_tmp is not None and audit_tmp.exists():
+            audit_tmp.unlink()
+        if isinstance(e, sqlite3.Error):
+            logger.error(f"fix-paths failed (rolled back, library unchanged): {e}")
+            return 1
+        raise
     finally:
         conn.close()
+    if audit_tmp is not None and audit_tmp.exists():
+        audit_tmp.replace(audit_log_path)
 
-    print_fix_stats(stats, dry_run=not apply)
+    print_fix_stats(stats, dry_run=False)
     if audit_log_path is not None:
-        print(f"{'Audit log' if apply else 'Dry-run report (nothing was written to the library)'}: "
-              f"{audit_log_path}")
-    if apply:
-        # Reminder for the rollback case: SQLite leaves -wal/-shm sibling
-        # files alongside the main DB. Restoring just master.sqlite from
-        # the BACKUP file without removing those leaves the live WAL in
-        # control, hiding the restore.
-        print(
-            "\nRollback note: if you need to revert, also delete "
-            f"{library_path.name}-wal and {library_path.name}-shm "
-            "before restoring the backup over master.sqlite.\n"
-        )
+        print(f"Audit log: {audit_log_path}")
+    print(
+        "Applied to root.sqlite. Start Serato and look at the entries the run changed.\n"
+        f"To undo: quit Serato and restore the three .BACKUP.{ts} files (root.sqlite, "
+        "master.sqlite and manifest.json). See docs/troubleshooting.md."
+    )
+    _remove_old_backups(keep_backups)
     return 0

@@ -9,6 +9,7 @@ usage see [usage.md](usage.md).
 - [Design decisions](#design-decisions)
   - [Serato 4.x crate engine](#serato-4x-crate-engine)
 - [What the statements about Serato rest on](#what-the-statements-about-serato-rest-on)
+- [How `fix-paths` writes a repair](#how-fix-paths-writes-a-repair)
 - [Serato crate file format](#serato-crate-file-format)
 - [Track metadata (BPM, key, etc.)](#track-metadata)
 - [Running tests](#running-tests)
@@ -24,15 +25,13 @@ Serato keeps two largely independent stores on disk:
 - **`~/Library/Application Support/Serato/Library/`** — the SQLite
   library. `master.sqlite` is the aggregate Serato opens (asset rows —
   one per indexed file path — crate membership, smart-crate rules, and
-  preferences). `diagnose` and `verify-paths` read it; `fix-paths` and
-  `sync --prune` / `--clean` write it. On **Serato 4.x and later**,
-  `root.sqlite` is the authoritative,
-  revision-tracked "Serato Library" space store that `sync` writes to
-  create crates and import tracks; Serato aggregates it into
-  `master.sqlite` on launch. See [Serato 4.x crate engine](#serato-4x-crate-engine).
-  `fix-paths` writes `master.sqlite` only, so on 4.x and later its
-  repairs leave `root.sqlite` unchanged: see the caution at the top of
-  `fix-paths` in usage.md.
+  preferences). `diagnose` and `verify-paths` read it; `sync --prune`
+  and `--clean` write it. On **Serato 4.x and later**, `root.sqlite` is
+  the authoritative, revision-tracked "Serato Library" space store.
+  `sync` writes it to create crates and import tracks, and `fix-paths`
+  writes it to repair paths; Serato aggregates it into `master.sqlite`
+  on launch. See [Serato 4.x crate engine](#serato-4x-crate-engine) and
+  [How `fix-paths` writes a repair](#how-fix-paths-writes-a-repair).
 
 There's also a legacy `~/Music/_Serato_/database V2` file from older
 Serato versions; this tool does not touch it directly. On Serato DJ
@@ -190,6 +189,9 @@ measured on a second library.
 | Serato analyses tracks that `sync` imports | Measured on 4.x (two files, 31 May 2026). On 5.0.0: 1,613 of the 1,615 tracks added to the library on 31 October 2026 had been analysed. |
 | Serato needs the raised revision numbers to read the change | Every measured run raised them. No run was made without, so this is not measured. |
 | A repair written to `master.sqlite` alone is lost when Serato starts | Not measured on any version. Inferred from the two-database design. |
+| Serato takes up a path changed in `root.sqlite` | Not measured. `fix-paths` stamps the row with the new revision and advances the revision numbers as for a new track, which Serato does take up. |
+| Serato takes up an entry deleted from `root.sqlite` | Measured on Serato 5.0.0 on 27 November 2026: two merges written to `root.sqlite`, then one Serato launch. Both deleted entries were gone from `master.sqlite`, and both kept copies were still in their crates, not missing. Then 206 more merges and one more launch, the same day: all 206 entries gone, all 201 kept copies present and not missing, all 132 crates that held a spare still holding its kept copy, and no other change to the Serato Library's tracks. Measured on that one library only. |
+| What `fix-paths` writes is valid in `root.sqlite` | Measured on 27 November 2026 on an empty database built from the real 5.0 schema, with invented rows: a merge, a path change and an orphan delete, then `foreign_key_check` and `quick_check`, both clean. `tests/test_real_schema.py` runs it again when it is pointed at a `root.sqlite`. Not checked on the 4.x schema (202), so `fix-paths --apply` is refused there. |
 | A crate removed from `root.sqlite` alone stays in `master.sqlite` | Measured on 4.x, as the plan records (the clean-up of the proofs of concept). Not measured on 5.0. |
 | Removing crates from both databases (`--prune`, `--clean`) works | No dated measurement of a real run is recorded for either version. On 5.0 it cannot finish (next line). |
 | A plain SQLite connection cannot run `integrity_check` or `quick_check` on a 5.0 `master.sqlite`, nor delete from its `anonymous_table_*` tables | Measured on 27 November 2026 with SQLite 3.53.1, on an empty database built from the real 5.0 schema. The 4.x schema has no index with that collation. |
@@ -203,25 +205,49 @@ measured on a second library.
 | Serato before 4.0 has no SQLite library | From Serato's 4.0.0 release notes. Not measured. |
 | The Windows library path | Not measured. |
 
-### Why `fix-paths` loads the asset table into memory
+## How `fix-paths` writes a repair
 
-Per-row SQL lookups against `master.sqlite` are catastrophically slow
-because the unique index on `(location_id, portable_id)` uses
-`COLLATE NOCASE` — a default-collation equality query falls back to a
-full scan. One up-front `SELECT id, location_id, portable_id FROM
-asset` plus dict lookups is orders of magnitude faster, and tolerates
-contention from a running Serato much better.
+`fix-paths` writes `root.sqlite`, with the helpers and the rules of the
+crate engine above: Serato quit, a yes before the write, the three
+backups, one transaction, `foreign_key_check` and `quick_check` before
+the commit, and the raised revision numbers. It has its own list of
+checked schema versions, which holds 203 only.
 
-### Why `fix-paths` cleans up informal `asset_id` columns
+- **Entries are found by path.** `path-fixes.csv` comes from
+  `master.sqlite`, and its `asset_id` means nothing in `root.sqlite`.
+  The tracks of the Serato Library space are loaded once into a
+  dictionary keyed by path, in the form the crate engine compares paths
+  in. An old path with no entry there is skipped.
+- **A path change** is an `UPDATE` of `asset.portable_id` and
+  `asset.file_name`, stamped with the new revision. (In every row of
+  the one real library measured, `file_name` is the last part of
+  `portable_id`.) No trigger of
+  `root.sqlite` fires on that, so the space's revision is advanced with
+  the statement those triggers use.
+- **A merge** moves crate memberships, then deletes the broken entry.
+  A membership is a `container_asset` row that points at the track's
+  `space_asset`. For each crate that holds the broken entry and not the
+  kept copy, a new `container_asset` row is inserted for the kept copy,
+  with the old row's `list_order`, so that it keeps its place. `sync`
+  adds memberships with the same insert, and Serato has been seen to
+  copy those into `master.sqlite` for crates `sync` made; for a crate
+  you made it is not measured. The broken `asset` row is then deleted;
+  `space_asset`, its `container_asset` rows, `dj_asset_metadata` and
+  `asset_auxiliary` go with it by `ON DELETE CASCADE`.
+- **An orphan** is that delete alone.
 
-Real Serato schemas reference `asset.id` from several tables without a
-formal `FOREIGN KEY` constraint — `container_asset` and the
-`anonymous_table_*` sort caches in particular. Trusting only formal
-FKs leaves dangling rows behind on asset DELETE; Serato's library scan
-then crashes with `Sqlite Error (787): FOREIGN KEY constraint failed`
-when it tries to populate downstream FK-constrained tables from the
-stale references. `get_asset_referencing_columns()` enumerates every
-`asset_id` column (formal or informal) so cleanup hits both.
+**Why not `master.sqlite`.** Until 27 November 2026 `fix-paths` wrote
+`master.sqlite`. Two measured faults ended that. Its `container_asset`
+names a track twice, by `asset_id` and by `space_asset_id`, and the old
+merge moved only the first: the row was then deleted by cascade with
+the broken track's `space_asset`, so the membership was lost (measured
+on the real table shapes). And on Serato 5.0 the file can be neither
+checked nor changed without Serato's own collation. A third reason is
+inferred: Serato copies changes from `root.sqlite` into `master.sqlite`
+when it starts, so a repair made to `master.sqlite` alone may not hold.
+The old writer also deleted the play
+history of an orphan, which Serato keeps (`history_entry.asset_id` is
+`ON DELETE SET NULL`).
 
 ## Serato crate file format
 
@@ -250,5 +276,5 @@ Or simply load tracks to a deck — Serato analyses them automatically.
 ## Running tests
 
 See [CONTRIBUTING.md](../CONTRIBUTING.md) for the dev-environment
-setup, the test commands, and the safety invariants `fix-paths` must
-preserve.
+setup, the test commands, and the safety invariants the commands that
+write must preserve.

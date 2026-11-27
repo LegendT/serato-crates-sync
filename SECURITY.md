@@ -29,7 +29,7 @@ promptly. Non-security bugs can be reported via normal GitHub issues.
 
 In scope:
 
-- Bugs in `fix-paths` that could leave `master.sqlite` in an
+- Bugs in `fix-paths` that could leave `root.sqlite` in an
   inconsistent state (dangling references, broken foreign keys,
   silently lost crate memberships, missed backups).
 - Bugs in `sync` that could overwrite user data without a recoverable
@@ -56,41 +56,41 @@ Regressions in any of the rules below are treated as security issues.
 
 ### `fix-paths --apply`
 
-Before the numbered rules: the command line refuses `--apply` when a
-`root.sqlite` is beside the library file, which is the case for every
-Serato 4.x and later library, and writes nothing, not even the backup.
-A repair to `master.sqlite` alone can be lost there, and on Serato's
-real tables a merge loses the crate memberships it is meant to move
-(see the known fault under `fix-paths` in docs/usage.md). The check is
-in `cli.py`; code that calls `run_fix_paths` itself does not get it.
-
-Where that refusal does not apply, `fix-paths --apply` enforces these
-invariants on every run:
+`fix-paths --apply` writes `root.sqlite`. It enforces these invariants
+on every run:
 
 1. Refuses to run if Serato DJ Pro / Studio / Lite is detected via
-   `pgrep` (macOS), or if another writer holds the database lock
-   (`BEGIN IMMEDIATE`). On platforms without `pgrep` the lock check
-   is the only guard.
-2. Backs up `master.sqlite` via SQLite's Backup API and verifies the
-   snapshot with `PRAGMA integrity_check` before any writes. A snapshot
-   that fails the check is deleted.
-3. Verifies `PRAGMA foreign_keys` engaged before relying on foreign-key
-   actions.
-4. Wraps everything in a single transaction; rolls back on any error.
-5. Runs a WAL checkpoint after commit so a downstream copy of
-   `master.sqlite` (without the `-wal` / `-shm` siblings) reflects
-   the fix.
+   `pgrep` (macOS), and if `root.sqlite` is at any schema version other
+   than 203, the one these writes were checked on. On platforms without
+   `pgrep`, the database lock (`BEGIN IMMEDIATE`) is the only guard.
+2. Makes a read-only pass first. A run with nothing to change stops
+   there, with no backup made. A run with something to change asks
+   first, unless `--yes`; without a terminal it is refused with exit
+   code 1.
+3. Before any write, snapshots `root.sqlite` and `master.sqlite` with
+   SQLite's Backup API and copies the manifest, under one timestamp. If
+   a snapshot cannot be made, nothing is written.
+4. Verifies `PRAGMA foreign_keys` engaged before relying on
+   `ON DELETE CASCADE`.
+5. Wraps everything in a single transaction, with `foreign_key_check`
+   and `quick_check` before the commit; rolls back on any error.
 6. Audit log is written to a `.inprogress` tmp file and atomic-renamed
    to its final path only after a successful commit. A dry run writes
    its rows to `fix-paths-dry-run.csv`, never to the audit log.
-7. Cleans up rows in informal `asset_id` columns (no foreign key),
-   which no foreign-key action reaches. Rows behind a foreign key are
-   left to the engine: `history_entry` is `ON DELETE SET NULL`, so the
-   play history of a deleted track is kept.
+7. A merge moves each crate membership of the broken entry to the kept
+   copy before the broken entry is deleted, and adds none the kept copy
+   already has.
+8. Removes old backups under the same rule as `sync` (rule 7 below).
 
-Each rule has a test in `tests/test_cli_smoke.py` or
-`tests/test_fix_paths.py`, with two exceptions: the database-lock half
-of rule 1, and rule 3, which needs an SQLite built without foreign keys.
+Each rule has a test in `tests/test_fix_paths.py` or
+`tests/test_cli_smoke.py`, with two exceptions:
+the database-lock half of rule 1, and rule 4, which needs an SQLite
+built without foreign keys.
+
+Known limit. How Serato takes a changed path, and a membership moved
+into a crate the user made, up from `root.sqlite` is not measured. A
+deleted entry is: see the caution at the top of `fix-paths` in
+docs/usage.md.
 
 ### `sync --apply`, `--prune` and `--clean` on Serato 4.x and later
 
